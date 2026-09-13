@@ -1,0 +1,82 @@
+# Heretic DGX on four NVIDIA DGX Sparks (tensor parallel 4).
+#
+# Four nodes, one NCCL rank each, for models that do not fit on two Sparks --
+# specifically DeepSeek V4.1 Flash, whose transformer weights need TP4 and
+# whose Engram n-gram tables (1.573e12 parameters, ~1.43 TiB in fp8) stay on
+# the SSD.
+#
+# Copy outside the repository, fill in real values, and do not commit it.
+#
+#   cp cluster.tp4.example.toml ../heretic-cluster-tp4.toml
+#
+# Run from the coordinator (the first node listed):
+#
+#   uv run heretic \
+#     --cluster ../heretic-cluster-tp4.toml \
+#     --config ./config.default.toml \
+#     --model /models/DeepSeek-V4.1-Flash
+#
+# See docs/TP4.md for the full runbook, including the checkpoint layout the
+# Engram disk mode expects.
+
+# Absolute path to the interpreter on every node. Must exist at this path on
+# all four hosts, and must be the same Python that has heretic installed.
+python = "/opt/heretic-dgx/.venv/bin/python"
+
+# Absolute path to the checkout on every node. Each rank runs
+# `python -m heretic.rank_application` from here, with PYTHONPATH=<workdir>/src.
+workdir = "/opt/heretic-dgx"
+
+backend = "nccl"
+master_port = 29500
+
+# Generous, because the first load of a TP4 checkpoint from disk is slow.
+timeout_seconds = 3600
+
+# The fabric interface used for NCCL traffic (not the management path). On a
+# four-node Spark cluster this is the high-speed interconnect, for example
+# "enp1s0f0np0" or "enP2p1s0f0np0". Verify with `ip -br link` on each node.
+nccl_socket_ifname = "<fabric-interface>"
+
+# --- Engram (n-gram) tables on disk ----------------------------------------
+#
+# DeepSeek V4.1 Flash keeps its n-gram hash tables on the SSD instead of in
+# memory. This is what makes TP4 viable: the tables are ~1.43 TiB in total,
+# and each rank would otherwise need ~366 GiB resident.
+#
+# engram_disk_path must point at the extracted Hugging Face checkpoint
+# directory -- the one containing `model.safetensors.index.json` and the
+# `model-*-of-*.safetensors` shards -- at the same absolute path on all four
+# nodes. The tables are opened O_RDONLY and never written.
+engram_disk = true
+engram_disk_path = "/models/DeepSeek-V4.1-Flash"
+engram_disk_threads = 32
+engram_disk_chunk = 16
+
+# --- The four nodes, ordered by rank ---------------------------------------
+#
+# Rank 0 is the coordinator and is launched locally; ranks 1-3 are launched
+# over SSH. `host` is the SSH destination (an alias from ~/.ssh/config works
+# well); `rank_address` is the address NCCL uses for rank traffic, and rank 0's
+# rank_address becomes MASTER_ADDR.
+#
+# The addresses below are Tailscale (100.64.0.0/10) mesh addresses. If your
+# nodes also have a direct high-speed fabric, prefer those addresses for
+# rank_address and keep Tailscale for the SSH `host` path -- collective
+# performance over a mesh is much worse than over a direct link.
+
+[[nodes]]
+host = "<coordinator-ssh-host>"
+rank_address = "<coordinator-fabric-address>"
+
+[[nodes]]
+host = "<worker-1-ssh-host>"
+rank_address = "<worker-1-fabric-address>"
+
+[[nodes]]
+host = "<worker-2-ssh-host>"
+rank_address = "<worker-2-fabric-address>"
+
+[[nodes]]
+host = "<worker-3-ssh-host>"
+rank_address = "<worker-3-fabric-address>"

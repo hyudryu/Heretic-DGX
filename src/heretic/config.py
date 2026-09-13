@@ -167,7 +167,7 @@ class Settings(BaseSettings):
 
     cluster: str | None = Field(
         default=None,
-        description="Path to an exactly-two-node DGX Spark cluster TOML file.",
+        description="Path to a multi-node DGX Spark cluster TOML file.",
         exclude=True,
     )
 

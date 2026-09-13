@@ -46,8 +46,8 @@ def launch_cluster_application(
     argv: Sequence[str],
     *,
     host_environment: Mapping[str, str] | None = None,
-) -> tuple[RankApplicationResult, RankApplicationResult]:
-    """Build, preflight, and launch the fixed two-rank application once."""
+) -> tuple[RankApplicationResult, ...]:
+    """Build, preflight, and launch the cluster application once."""
 
     if settings.cluster is None:
         raise ValueError("cluster application requires --cluster")
@@ -82,6 +82,6 @@ def run_cluster_cli(argv: Sequence[str]) -> int:
         host_environment=os.environ,
     )
     sys.stdout.write(results[0].stdout)
-    sys.stderr.write(results[0].stderr)
-    sys.stderr.write(results[1].stderr)
+    for result in results:
+        sys.stderr.write(result.stderr)
     return 0

@@ -28,8 +28,8 @@ class RankPreflightIdentity:
     checkpoint: CheckpointPayloadIdentity
 
     def __post_init__(self) -> None:
-        if self.rank not in (0, 1) or type(self.rank) is not int:
-            raise ValueError("preflight rank must be 0 or 1")
+        if type(self.rank) is not int or self.rank < 0:
+            raise ValueError("preflight rank must be a nonnegative integer")
         if type(self.source) is not SourceIdentity:
             raise TypeError("preflight source must be exactly SourceIdentity")
         if type(self.checkpoint) is not CheckpointPayloadIdentity:
@@ -42,22 +42,28 @@ class RankPreflightIdentity:
 
 
 def require_matching_rank_preflights(
-    first: RankPreflightIdentity,
-    second: RankPreflightIdentity,
+    identities: tuple[RankPreflightIdentity, ...],
 ) -> RankPreflightIdentity:
-    """Require exact two-rank identity agreement before process launch."""
+    """Require exact identity agreement across every rank before process launch."""
 
-    if (
-        type(first) is not RankPreflightIdentity
-        or type(second) is not RankPreflightIdentity
-    ):
+    if len(identities) < 2:
+        raise RuntimeError("rank preflights require at least two identities")
+    if any(type(identity) is not RankPreflightIdentity for identity in identities):
         raise TypeError("rank preflights must be exactly RankPreflightIdentity")
-    if (first.rank, second.rank) != (0, 1):
-        raise RuntimeError("rank preflights must be ordered as rank 0 then rank 1")
-    if first.source != second.source:
-        raise RuntimeError("rank source/runtime identities do not match")
-    if first.checkpoint != second.checkpoint:
-        raise RuntimeError("rank checkpoint-payload identities do not match")
+    if tuple(identity.rank for identity in identities) != tuple(range(len(identities))):
+        raise RuntimeError(
+            "rank preflights must be ordered by ascending contiguous rank"
+        )
+    first = identities[0]
+    for identity in identities[1:]:
+        if identity.source != first.source:
+            raise RuntimeError(
+                f"rank {identity.rank} source/runtime identity does not match rank 0"
+            )
+        if identity.checkpoint != first.checkpoint:
+            raise RuntimeError(
+                f"rank {identity.rank} checkpoint-payload identity does not match rank 0"
+            )
     return first
 
 

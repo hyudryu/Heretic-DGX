@@ -1,48 +1,86 @@
 # Heretic DGX
 
-Heretic DGX is a two-node NVIDIA DGX Spark implementation of
+Heretic DGX is a multi-node NVIDIA DGX Spark implementation of
 [`p-e-w/heretic`](https://github.com/p-e-w/heretic). It runs Heretic's
-directional-ablation optimization across exactly two DGX Spark systems and
+directional-ablation optimization across a cluster of DGX Spark systems and
 exports a standalone checkpoint.
+
+It supports two configurations:
+
+- **Two nodes** — the original release-0.1 topology, validated end to end.
+- **Four nodes (TP4)** — for models that need more memory, specifically
+  DeepSeek V4.1 Flash, whose Engram n-gram tables stay on the SSD.
+  See [`docs/TP4.md`](docs/TP4.md).
 
 ## Relationship to the original Heretic project
 
 This repository is an independent downstream fork of Philipp Emanuel
 Weidmann's original
 [`p-e-w/heretic`](https://github.com/p-e-w/heretic), based on upstream commit
-[`bedb94e`](https://github.com/p-e-w/heretic/commit/bedb94ef117a271532ac2058447fbc165d5051bd).
+[`bedb94e`](https://github.com/p-e-w/heretic/commit/bedb94ef117a271532ac2058447fbc165d5051bd),
+itself downstream of
+[`cbertucci33/Heretic-DGX`](https://github.com/cbertucci33/Heretic-DGX).
 Heretic's abliteration method, scorer model, optimization approach, and core
 configuration remain upstream work.
 
 Heretic DGX adds the distributed execution layer needed to run that workflow
-across two DGX Spark systems:
+across a DGX Spark cluster:
 
 - coordinator-driven launch and rank supervision;
 - source, checkpoint, topology, and collective preflight checks;
 - mirrored prompt, residual, scoring, and optimization operations;
-- coordinated cancellation, failure reporting, and teardown; and
+- coordinated cancellation, failure reporting, and teardown;
 - standalone export that verifies target changes while preserving quantized
-  and non-target artifacts.
+  and non-target artifacts; and
+- read-only, disk-backed Engram (n-gram) tables for DeepSeek V4.1 Flash.
 
 For the original single-system project, documentation, and community, use the
 [upstream Heretic repository](https://github.com/p-e-w/heretic). Issues specific
-to the two-DGX implementation belong in this repository.
+to the DGX implementation belong in this repository.
+
+## DeepSeek V4.1 Flash and Engram on disk
+
+DeepSeek V4.1 Flash carries two Engram n-gram hash tables (layers 1 and 14) of
+1.573e12 parameters — about **1.43 TiB** in the checkpoint's fp8 form. A DGX
+Spark has 128 GB of unified memory, so those tables fit on no tensor-parallel
+degree this project targets: at TP4 each rank would still need ~366 GiB.
+
+With `engram_disk = true` the tables stay on the SSD and are read on demand, so
+only the transformer weights occupy memory. The tables are opened read-only
+(`O_RDONLY` + `POSIX_FADV_RANDOM`) and are never modified.
+
+This is practical because each rank reads only its own row range (~47 GiB at
+TP4, not 1.43 TiB), the whole forward's hash ids are gathered in one batch, and
+rows are de-duplicated before reading. It is a port of the mechanism used by
+the working vLLM DGX Spark deployment, without the vLLM dependency.
+
+Set it up in the cluster file:
+
+```toml
+engram_disk = true
+engram_disk_path = "/models/DeepSeek-V4.1-Flash"
+```
+
+See [`docs/TP4.md`](docs/TP4.md) for the full runbook.
 
 ## Release 0.1 scope
 
-- One coordinator command launches one GPU-backed rank on each of two nodes.
-- Both ranks load the model through Transformers tensor parallelism.
+- One coordinator command launches one GPU-backed rank on each node.
+- Every rank loads the model through Transformers tensor parallelism.
 - Preflight checks verify node reachability, source identity, checkpoint
   identity, topology, and collective communication before optimization.
 - Prompt ingestion, residual calculation, scoring, optimization, winner
-  restoration, and model materialization are coordinated across both ranks.
+  restoration, and model materialization are coordinated across all ranks.
 - Failure, cancellation, timeout, and teardown behavior is bounded so a failed
-  peer does not leave the other rank running indefinitely.
+  peer does not leave the other ranks running indefinitely.
 - The standalone exporter preserves non-target files and quantized tensors and
   verifies intended tensor changes before reporting success.
 
-This release is intentionally narrow: **Linux, exactly two DGX Spark nodes,
-NCCL, and one rank per node**. It is not a general multi-node backend.
+This release is narrow by design: **Linux, NCCL, and one rank per node.** The
+two-node topology is validated end to end; the TP4 topology and the disk-backed
+Engram path are implemented and unit-tested but have not yet been run on
+physical four-node hardware. See
+[`docs/TP4.md`](docs/TP4.md#10-validation-status-and-limits).
 
 ## Validated model
 
@@ -59,38 +97,40 @@ from `mlabonne/harmless_alpaca`.
 
 ## Requirements
 
-- Two DGX Spark systems running Linux
+- Two or four DGX Spark systems running Linux (one rank per node)
 - CUDA, NCCL, and working node-to-node GPU collective communication
-- Key-based SSH from the coordinator to both nodes
-- The same clean Heretic DGX revision and model checkpoint on both nodes
+- Key-based SSH from the coordinator to every worker node
+- The same clean Heretic DGX revision and model checkpoint on every node
 - Python 3.10 or newer and [`uv`](https://docs.astral.sh/uv/)
+- For DeepSeek V4.1 Flash: the extracted Hugging Face checkpoint on local
+  storage on every node, for the Engram disk path
 
 Use a dedicated high-speed fabric for rank traffic and keep a separate
 management path for SSH and recovery.
 
 ## Install
 
-Run on both nodes at the same absolute path:
+Run on every node at the same absolute path:
 
 ```sh
-git clone https://github.com/cbertucci33/Heretic-DGX.git
+git clone https://github.com/hyudryu/Heretic-DGX.git
 cd Heretic-DGX
-git checkout v0.1.0
 uv sync --frozen
 ```
 
 ## Configure the cluster
 
-Copy the example outside the repository and replace every placeholder:
+Copy an example outside the repository and replace every placeholder:
 
 ```sh
-cp cluster.example.toml ../heretic-cluster.toml
+cp cluster.example.toml ../heretic-cluster.toml      # two nodes
+cp cluster.tp4.example.toml ../heretic-cluster.toml  # four nodes (TP4)
 ```
 
-The two entries in `[[nodes]]` are ordered by rank: the coordinator is rank 0
-and the worker is rank 1. `host` is the SSH destination; `rank_address` is the
-address used for distributed traffic. `nccl_socket_ifname` must name the fabric
-interface present on both systems.
+The entries in `[[nodes]]` are ordered by rank: the first is the coordinator
+(rank 0), and the rest are workers. `host` is the SSH destination;
+`rank_address` is the address used for distributed traffic.
+`nccl_socket_ifname` must name the fabric interface present on every node.
 
 Do not commit live hostnames, addresses, credentials, or private cluster
 configuration.
@@ -136,6 +176,6 @@ before creating or distributing a derivative.
 ## Attribution and license
 
 Heretic DGX retains the original project's AGPL-3.0-or-later license and
-copyright notices. The two-node distributed implementation and release-specific
-changes are maintained in this repository. Heretic DGX is not presented as an
-official upstream release.
+copyright notices. The distributed implementation and release-specific changes
+are maintained in this repository. Heretic DGX is not presented as an official
+upstream release.

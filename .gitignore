@@ -12,6 +12,9 @@ wheels/
 # Caches
 /.ruff_cache/
 
+# Local code intelligence index
+/.codegraph/
+
 # Editors
 /.vscode/
 

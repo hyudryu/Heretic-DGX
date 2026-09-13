@@ -48,8 +48,10 @@ def main(argv: list[str] | None = None) -> int:
     rank = _required_integer("RANK")
     world_size = _required_integer("WORLD_SIZE")
     timeout_seconds = _required_integer("HERETIC_DGX_TIMEOUT_SECONDS")
-    if rank not in (0, 1) or world_size != 2:
-        raise ValueError("collective probe requires ranks 0/1 and WORLD_SIZE=2")
+    if world_size < 2 or not 0 <= rank < world_size:
+        raise ValueError(
+            "collective probe requires WORLD_SIZE >= 2 and RANK in [0, WORLD_SIZE)"
+        )
     if timeout_seconds <= 0:
         raise ValueError("HERETIC_DGX_TIMEOUT_SECONDS must be positive")
     if os.environ.get("CUDA_VISIBLE_DEVICES") != "":

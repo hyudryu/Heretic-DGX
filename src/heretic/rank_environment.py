@@ -19,6 +19,10 @@ class RankEnvironment:
     backend: Literal["nccl"]
     timeout_seconds: int
     nccl_socket_ifname: str | None
+    engram_disk: bool = False
+    engram_directory: str | None = None
+    engram_threads: int = 32
+    engram_chunk: int = 16
 
 
 def _required(values: Mapping[str, str], name: str) -> str:
@@ -30,7 +34,11 @@ def _required(values: Mapping[str, str], name: str) -> str:
     return value
 
 
-def _integer(values: Mapping[str, str], name: str) -> int:
+def _integer(
+    values: Mapping[str, str], name: str, *, default: int | None = None
+) -> int:
+    if default is not None and name not in values:
+        return default
     raw = _required(values, name)
     try:
         return int(raw)
@@ -54,10 +62,10 @@ def read_rank_environment(values: Mapping[str, str]) -> RankEnvironment:
     backend = _required(values, "HERETIC_DGX_BACKEND")
     timeout_seconds = _integer(values, "HERETIC_DGX_TIMEOUT_SECONDS")
 
-    if world_size != 2:
-        raise ValueError("WORLD_SIZE must be exactly 2")
-    if rank not in (0, 1):
-        raise ValueError("RANK must be 0 or 1")
+    if world_size < 2:
+        raise ValueError("WORLD_SIZE must be at least 2")
+    if not 0 <= rank < world_size:
+        raise ValueError("RANK must be in [0, WORLD_SIZE)")
     if local_rank != 0:
         raise ValueError("LOCAL_RANK must be 0 for one process per node")
     expected_role = "coordinator" if rank == 0 else "worker"
@@ -80,6 +88,28 @@ def read_rank_environment(values: Mapping[str, str]) -> RankEnvironment:
     if "@" in master_address or "://" in master_address:
         raise ValueError("MASTER_ADDR must not contain credentials or a URL scheme")
 
+    engram_disk = values.get("HERETIC_ENGRAM_DISK", "0") == "1"
+    engram_directory = values.get("HERETIC_ENGRAM_DIR")
+    if engram_disk:
+        if type(engram_directory) is not str or not engram_directory.strip():
+            raise ValueError(
+                "HERETIC_ENGRAM_DIR must be a nonempty string when "
+                "HERETIC_ENGRAM_DISK is enabled"
+            )
+        if "\x00" in engram_directory:
+            raise ValueError("HERETIC_ENGRAM_DIR must not contain NUL")
+    elif engram_directory is not None and (
+        type(engram_directory) is not str or not engram_directory.strip()
+    ):
+        raise ValueError("HERETIC_ENGRAM_DIR must be a nonempty string when set")
+
+    engram_threads = _integer(values, "HERETIC_ENGRAM_THREADS", default=32)
+    engram_chunk = _integer(values, "HERETIC_ENGRAM_CHUNK", default=16)
+    if engram_threads <= 0:
+        raise ValueError("HERETIC_ENGRAM_THREADS must be positive")
+    if engram_chunk <= 0:
+        raise ValueError("HERETIC_ENGRAM_CHUNK must be positive")
+
     return RankEnvironment(
         rank=rank,
         local_rank=local_rank,
@@ -90,4 +120,8 @@ def read_rank_environment(values: Mapping[str, str]) -> RankEnvironment:
         backend="nccl",
         timeout_seconds=timeout_seconds,
         nccl_socket_ifname=nccl_socket_ifname,
+        engram_disk=engram_disk,
+        engram_directory=engram_directory,
+        engram_threads=engram_threads,
+        engram_chunk=engram_chunk,
     )

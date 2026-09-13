@@ -1,5 +1,16 @@
-# Exactly two DGX Spark nodes are supported. Use management names for SSH and
-# fabric addresses for rank traffic. The fabric must not be the default route.
+# Heretic DGX cluster definition.
+#
+# One [[nodes]] entry per node, ordered by rank: the first entry is the
+# coordinator (rank 0) and runs the CLI you invoke locally. Every other entry
+# is launched over SSH. Two nodes is the original validated configuration;
+# four nodes is TP4, used for DeepSeek V4.1 Flash.
+#
+# Use management names for SSH and fabric addresses for rank traffic. The
+# fabric must not be the default route.
+#
+# Copy this file outside the repository and replace every placeholder. Do not
+# commit live hostnames, addresses, credentials, or private cluster config.
+
 python = "/opt/heretic-dgx/.venv/bin/python"
 workdir = "/opt/heretic-dgx"
 backend = "nccl"
@@ -14,3 +25,30 @@ rank_address = "<coordinator-fabric-address>"
 [[nodes]]
 host = "<worker-ssh-host>"
 rank_address = "<worker-fabric-address>"
+
+# Add more entries for TP4 -- see cluster.tp4.example.toml.
+
+# ---------------------------------------------------------------------------
+# DeepSeek V4.1 Flash: Engram (n-gram) tables on disk
+# ---------------------------------------------------------------------------
+#
+# DeepSeek V4.1 Flash carries two Engram n-gram tables (layers 1 and 14) of
+# 1.573e12 parameters total -- about 1.43 TiB in the checkpoint's fp8 form.
+# A DGX Spark has 128 GB of unified memory, so those tables do not fit on any
+# tensor-parallel degree this project targets. With `engram_disk = true` they
+# stay on the SSD and rows are read on demand, so only the transformer weights
+# occupy memory.
+#
+# This requires the extracted Hugging Face checkpoint (the directory holding
+# `model.safetensors.index.json` and its shards) at the same absolute path on
+# every node. The tables are opened read-only (O_RDONLY + POSIX_FADV_RANDOM)
+# and are never written.
+#
+# engram_disk_threads / engram_disk_chunk tune the shared read pool. The
+# defaults match the validated vLLM DGX Spark deployment (32 threads, chunk
+# 16); a step's reads for both layers go out as one parallel batch.
+#
+# engram_disk = true
+# engram_disk_path = "/models/DeepSeek-V4.1-Flash"
+# engram_disk_threads = 32
+# engram_disk_chunk = 16

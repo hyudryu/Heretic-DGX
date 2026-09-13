@@ -44,19 +44,22 @@ def _run_probe_plan(
 
 
 def _collect_rank_collective_probes(
-    plans: tuple[RankLaunchPlan, RankLaunchPlan],
+    plans: tuple[RankLaunchPlan, ...],
     *,
     timeout_seconds: int,
-) -> tuple[CollectiveProbeResult, CollectiveProbeResult]:
-    """Run two CPU-only ranks concurrently and require a successful all-reduce."""
+) -> tuple[CollectiveProbeResult, ...]:
+    """Run every CPU-only rank concurrently and require a successful all-reduce."""
 
-    if tuple(plan.rank for plan in plans) != (0, 1):
-        raise ValueError("rank launch plans must be ordered as rank 0 then rank 1")
+    expected_ranks = tuple(range(len(plans)))
+    if tuple(plan.rank for plan in plans) != expected_ranks:
+        raise ValueError(
+            "rank launch plans must be ordered by ascending contiguous rank"
+        )
     if type(timeout_seconds) is not int or timeout_seconds <= 0:
         raise ValueError("collective probe timeout must be a positive integer")
 
     results: dict[int, CollectiveProbeResult] = {}
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=len(plans)) as executor:
         futures = {
             executor.submit(
                 _run_probe_plan, plan, timeout_seconds=timeout_seconds
@@ -67,15 +70,18 @@ def _collect_rank_collective_probes(
             result = future.result()
             results[result.rank] = result
 
-    ordered = results[0], results[1]
+    ordered = tuple(results[rank] for rank in expected_ranks)
+    world_size = len(plans)
+    # Rank r contributes r+1, so the all-reduce is 1 + 2 + ... + world_size.
+    expected_total = world_size * (world_size + 1) // 2
     expected = [
         CollectiveProbeResult(
             rank=rank,
-            world_size=2,
+            world_size=world_size,
             backend="gloo",
-            reduced_value=3,
+            reduced_value=expected_total,
         )
-        for rank in (0, 1)
+        for rank in expected_ranks
     ]
     if list(ordered) != expected:
         raise RuntimeError("rank collective probe results do not agree")
@@ -83,13 +89,13 @@ def _collect_rank_collective_probes(
 
 
 def preflight_and_collect_rank_collective_probes(
-    plans: tuple[RankLaunchPlan, RankLaunchPlan],
+    plans: tuple[RankLaunchPlan, ...],
     checkpoint_directory: str,
     *,
     timeout_seconds: int,
 ) -> tuple[
     RankPreflightIdentity,
-    tuple[CollectiveProbeResult, CollectiveProbeResult],
+    tuple[CollectiveProbeResult, ...],
 ]:
     """Require matching rank identities before starting the collective probe."""
 

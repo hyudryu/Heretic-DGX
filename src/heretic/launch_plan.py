@@ -58,8 +58,8 @@ def build_rank_launch_plans(
     entry_module: str,
     seed: int,
     host_environment: Mapping[str, str] | None = None,
-) -> tuple[RankLaunchPlan, RankLaunchPlan]:
-    """Build exact two-rank process inputs without executing either process."""
+) -> tuple[RankLaunchPlan, ...]:
+    """Build one process input per node without executing any process."""
 
     if _MODULE_PATTERN.fullmatch(entry_module) is None:
         raise ValueError("rank entry module must be a dotted Python module name")
@@ -110,6 +110,11 @@ def build_rank_launch_plans(
         }
         if config.nccl_socket_ifname is not None:
             environment["NCCL_SOCKET_IFNAME"] = config.nccl_socket_ifname
+        if config.engram_disk_path is not None:
+            environment["HERETIC_ENGRAM_DISK"] = "1" if config.engram_disk else "0"
+            environment["HERETIC_ENGRAM_DIR"] = config.engram_disk_path
+            environment["HERETIC_ENGRAM_THREADS"] = str(config.engram_disk_threads)
+            environment["HERETIC_ENGRAM_CHUNK"] = str(config.engram_disk_chunk)
         plans.append(
             RankLaunchPlan(
                 rank=rank,
@@ -120,4 +125,4 @@ def build_rank_launch_plans(
                 environment=tuple(sorted(environment.items())),
             )
         )
-    return plans[0], plans[1]
+    return tuple(plans)

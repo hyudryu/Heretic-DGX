@@ -49,20 +49,26 @@ class DgxCommandChannel(Protocol):
 
     def receive(self) -> DgxCommand: ...
 
-    def complete(self, local_error: str | None) -> tuple[str | None, str | None]: ...
+    def complete(self, local_error: str | None) -> tuple[str | None, ...]: ...
 
 
 class TorchDistributedCommandChannel:
-    """Typed two-rank command channel over the initialized process group."""
+    """Typed multi-rank command channel over the initialized process group.
+
+    Rank 0 broadcasts every command to all worker ranks, so the same operation
+    runs in lockstep on the whole world. Completion gathers the error string
+    from every rank.
+    """
 
     def __init__(self) -> None:
         if not dist.is_available() or not dist.is_initialized():
             raise RuntimeError(
                 "DGX command channel requires an initialized process group"
             )
-        if dist.get_world_size() != 2:
-            raise RuntimeError("DGX command channel requires exactly two ranks")
+        if dist.get_world_size() < 2:
+            raise RuntimeError("DGX command channel requires at least two ranks")
         self._rank = dist.get_rank()
+        self._world_size = dist.get_world_size()
 
     def send(self, command: DgxCommand) -> None:
         if self._rank != 0:
@@ -71,8 +77,8 @@ class TorchDistributedCommandChannel:
         dist.broadcast_object_list(payload, src=0)
 
     def receive(self) -> DgxCommand:
-        if self._rank != 1:
-            raise RuntimeError("only DGX rank 1 may receive commands")
+        if self._rank == 0:
+            raise RuntimeError("DGX rank 0 does not receive its own commands")
         payload: list[object] = [None]
         dist.broadcast_object_list(payload, src=0)
         command = payload[0]
@@ -80,12 +86,12 @@ class TorchDistributedCommandChannel:
             raise TypeError("DGX command payload has an invalid type")
         return command
 
-    def complete(self, local_error: str | None) -> tuple[str | None, str | None]:
-        errors: list[object] = [None, None]
+    def complete(self, local_error: str | None) -> tuple[str | None, ...]:
+        errors: list[object] = [None] * self._world_size
         dist.all_gather_object(errors, local_error)
         if any(error is not None and type(error) is not str for error in errors):
             raise TypeError("DGX completion payload has an invalid type")
-        return errors[0], errors[1]  # type: ignore[return-value]
+        return tuple(errors)  # type: ignore[return-value]
 
 
 def _error_text(error: BaseException) -> str:
@@ -129,12 +135,20 @@ class DgxCoordinatorRuntime(ModelRuntime):
             self._active = False
             raise
 
-        if local_error is not None or rank_errors[1] is not None:
+        remote_failures = [
+            (rank, error)
+            for rank, error in enumerate(rank_errors)
+            if rank != 0 and error is not None
+        ]
+        if local_error is not None or remote_failures:
             self._failed = True
             self._active = False
             if local_error is not None:
                 raise local_error
-            raise RuntimeError(f"DGX worker failed: {rank_errors[1]}")
+            detail = "; ".join(
+                f"rank {rank}: {error}" for rank, error in remote_failures
+            )
+            raise RuntimeError(f"DGX worker failed: {detail}")
         if operation == "shutdown":
             self._active = False
             self._local_stopped = True
@@ -217,5 +231,13 @@ def run_dgx_worker(local: ModelRuntime, channel: DgxCommandChannel) -> None:
             raise local_error
         if rank_errors[0] is not None:
             raise RuntimeError(f"DGX coordinator failed: {rank_errors[0]}")
+        peer_failures = [
+            (rank, error)
+            for rank, error in enumerate(rank_errors)
+            if rank != 0 and error is not None
+        ]
+        if peer_failures:
+            detail = "; ".join(f"rank {rank}: {error}" for rank, error in peer_failures)
+            raise RuntimeError(f"DGX peer failed: {detail}")
         if command.operation == "shutdown":
             return

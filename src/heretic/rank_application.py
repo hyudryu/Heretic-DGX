@@ -56,11 +56,11 @@ def synchronize_rank_settings(
     *,
     rank: int,
 ) -> Settings | None:
-    """Broadcast rank 0's finalized settings before either model is constructed."""
+    """Broadcast rank 0's finalized settings before any model is constructed."""
 
-    if rank not in (0, 1):
-        raise ValueError("rank settings synchronization requires rank 0 or 1")
-    if rank == 1 and settings is not None:
+    if type(rank) is not int or rank < 0:
+        raise ValueError("rank settings synchronization requires a nonnegative rank")
+    if rank != 0 and settings is not None:
         raise ValueError("worker settings must come from rank 0")
 
     import torch.distributed as dist

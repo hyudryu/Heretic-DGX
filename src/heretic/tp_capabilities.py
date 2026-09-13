@@ -47,9 +47,9 @@ def _dtensor_topology(name: str, module: LoraTarget) -> TargetTopology | None:
         return None
     if placements is None or mesh is None:
         raise ValueError(f"incomplete DTensor metadata for LoRA target {name!r}")
-    if mesh.size() != 2:
+    if mesh.size() < 2:
         raise ValueError(
-            f"LoRA target {name!r} requires a two-rank device mesh; got {mesh.size()}"
+            f"LoRA target {name!r} requires a multi-rank device mesh; got {mesh.size()}"
         )
     if len(placements) != 1:
         raise ValueError(

@@ -95,7 +95,7 @@ def run_rank_application_plan(
     )
     command = rank_argv
     workdir: str | None = plan.workdir
-    if plan.rank == 1:
+    if plan.rank != 0:
         remote_command = (
             f"cd {shlex.quote(plan.workdir)} && exec {shlex.join(rank_argv)}"
         )
@@ -227,21 +227,24 @@ def _terminate_process_group(process: subprocess.Popen[str]) -> None:
 
 
 def collect_rank_applications(
-    plans: tuple[RankLaunchPlan, RankLaunchPlan],
+    plans: tuple[RankLaunchPlan, ...],
     *,
     timeout_seconds: int,
-) -> tuple[RankApplicationResult, RankApplicationResult]:
-    """Run exactly two rank applications concurrently and preserve rank order."""
+) -> tuple[RankApplicationResult, ...]:
+    """Run every rank application concurrently and preserve rank order."""
 
-    if tuple(plan.rank for plan in plans) != (0, 1):
-        raise ValueError("rank launch plans must be ordered as rank 0 then rank 1")
+    expected_ranks = tuple(range(len(plans)))
+    if tuple(plan.rank for plan in plans) != expected_ranks:
+        raise ValueError(
+            "rank launch plans must be ordered by ascending contiguous rank"
+        )
     if type(timeout_seconds) is not int or timeout_seconds <= 0:
         raise ValueError("rank application timeout must be a positive integer")
 
     results: dict[int, RankApplicationResult] = {}
     cancellation = Event()
     first_error: BaseException | None = None
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    with ThreadPoolExecutor(max_workers=len(plans)) as executor:
         futures = {
             executor.submit(
                 run_rank_application_plan,
@@ -262,19 +265,19 @@ def collect_rank_applications(
                 results[result.rank] = result
     if first_error is not None:
         raise first_error
-    return results[0], results[1]
+    return tuple(results[rank] for rank in expected_ranks)
 
 
 def preflight_and_collect_rank_applications(
-    plans: tuple[RankLaunchPlan, RankLaunchPlan],
+    plans: tuple[RankLaunchPlan, ...],
     checkpoint_directory: str,
     *,
     timeout_seconds: int,
 ) -> tuple[
     RankPreflightIdentity,
-    tuple[RankApplicationResult, RankApplicationResult],
+    tuple[RankApplicationResult, ...],
 ]:
-    """Require matching rank identities before starting either application."""
+    """Require matching rank identities before starting any application."""
 
     identity = collect_rank_preflights(
         plans,

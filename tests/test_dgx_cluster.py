@@ -122,6 +122,72 @@ rank_address = "10.10.10.2"
             all("HF_TOKEN" not in plan.environment_dict() for plan in plans)
         )
 
+    def test_four_node_config_builds_parseable_rank_plans(self) -> None:
+        cluster_file = self.root / "cluster-tp4.toml"
+        cluster_file.write_text(
+            'python = "/python"\nworkdir = "/work"\n'
+            "engram_disk = true\n"
+            'engram_disk_path = "/models/dsv41"\n'
+            "engram_disk_threads = 32\n"
+            "engram_disk_chunk = 16\n"
+            '[[nodes]]\nhost = "spark1"\nrank_address = "100.97.4.16"\n'
+            '[[nodes]]\nhost = "spark2"\nrank_address = "100.66.93.123"\n'
+            '[[nodes]]\nhost = "spark3"\nrank_address = "100.101.49.94"\n'
+            '[[nodes]]\nhost = "spark4"\nrank_address = "100.82.66.54"\n',
+            encoding="utf-8",
+        )
+
+        config = load_cluster_config(cluster_file)
+        self.assertEqual(config.world_size, 4)
+        self.assertEqual(config.master_address, "100.97.4.16")
+
+        plans = build_rank_launch_plans(
+            config,
+            ("/models/checkpoint",),
+            entry_module="heretic.rank_entry",
+            seed=7,
+        )
+        environments = [
+            read_rank_environment(plan.environment_dict()) for plan in plans
+        ]
+
+        self.assertEqual([plan.rank for plan in plans], [0, 1, 2, 3])
+        self.assertEqual(
+            [plan.role for plan in plans],
+            ["coordinator", "worker", "worker", "worker"],
+        )
+        self.assertEqual(
+            [
+                (environment.rank, environment.world_size)
+                for environment in environments
+            ],
+            [(0, 4), (1, 4), (2, 4), (3, 4)],
+        )
+        self.assertTrue(all(environment.engram_disk for environment in environments))
+        self.assertEqual(
+            [environment.engram_directory for environment in environments],
+            ["/models/dsv41"] * 4,
+        )
+        self.assertEqual(
+            [environment.engram_threads for environment in environments], [32] * 4
+        )
+        self.assertTrue(
+            all(plan.environment_dict()["WORLD_SIZE"] == "4" for plan in plans)
+        )
+
+    def test_engram_disk_requires_a_directory(self) -> None:
+        cluster_file = self.root / "cluster-bad-engram.toml"
+        cluster_file.write_text(
+            'python = "/python"\nworkdir = "/work"\n'
+            "engram_disk = true\n"
+            '[[nodes]]\nhost = "a"\nrank_address = "10.0.0.1"\n'
+            '[[nodes]]\nhost = "b"\nrank_address = "10.0.0.2"\n',
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "engram_disk_path"):
+            load_cluster_config(cluster_file)
+
     def test_identities_change_with_source_and_checkpoint_bytes(self) -> None:
         source_root = self.root / "source"
         checkpoint_root = self.root / "checkpoint"
@@ -191,14 +257,16 @@ rank_address = "10.10.10.2"
         rank_zero = RankPreflightIdentity(rank=0, source=source, checkpoint=checkpoint)
         rank_one = RankPreflightIdentity(rank=1, source=source, checkpoint=checkpoint)
 
-        self.assertIs(require_matching_rank_preflights(rank_zero, rank_one), rank_zero)
+        self.assertIs(
+            require_matching_rank_preflights((rank_zero, rank_one)), rank_zero
+        )
 
         mismatched = replace(
             rank_one,
             checkpoint=replace(rank_one.checkpoint, digest="f" * 64),
         )
         with self.assertRaisesRegex(RuntimeError, "checkpoint-payload"):
-            require_matching_rank_preflights(rank_zero, mismatched)
+            require_matching_rank_preflights((rank_zero, mismatched))
 
     def test_coordinator_collects_matching_rank_preflights(self) -> None:
         cluster_file = self.root / "cluster.toml"

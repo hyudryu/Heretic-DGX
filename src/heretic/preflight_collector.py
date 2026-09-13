@@ -15,15 +15,18 @@ from .rank_preflight import (
 
 
 def collect_rank_preflights(
-    plans: tuple[RankLaunchPlan, RankLaunchPlan],
+    plans: tuple[RankLaunchPlan, ...],
     checkpoint_directory: str | Path,
     *,
     timeout_seconds: int,
 ) -> RankPreflightIdentity:
-    """Collect exactly two bounded SSH preflights and require their agreement."""
+    """Collect one bounded SSH preflight per rank and require their agreement."""
 
-    if tuple(plan.rank for plan in plans) != (0, 1):
-        raise ValueError("rank launch plans must be ordered as rank 0 then rank 1")
+    expected_ranks = tuple(range(len(plans)))
+    if tuple(plan.rank for plan in plans) != expected_ranks:
+        raise ValueError(
+            "rank launch plans must be ordered by ascending contiguous rank"
+        )
     if type(timeout_seconds) is not int or timeout_seconds <= 0:
         raise ValueError("preflight timeout must be a positive integer")
 
@@ -40,7 +43,7 @@ def collect_rank_preflights(
             str(checkpoint_directory),
         )
         command = remote_argv
-        if plan.rank == 1:
+        if plan.rank != 0:
             command = (
                 "ssh",
                 "-o",
@@ -75,4 +78,4 @@ def collect_rank_preflights(
             )
         identities.append(identity)
 
-    return require_matching_rank_preflights(identities[0], identities[1])
+    return require_matching_rank_preflights(tuple(identities))
