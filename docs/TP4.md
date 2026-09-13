@@ -121,7 +121,14 @@ python = "/opt/heretic-dgx/.venv/bin/python"
 workdir = "/opt/heretic-dgx"
 backend = "nccl"
 master_port = 29500
-timeout_seconds = 3600
+
+# Bounds the ENTIRE run (every rank is wrapped in coreutils `timeout`).
+timeout_seconds = 604800          # 7 days, for a full 200-trial run
+
+# Separate process-group collective timeout, so a long run still fails fast
+# when a collective genuinely hangs. Must not exceed timeout_seconds.
+collective_timeout_seconds = 1800
+
 nccl_socket_ifname = "enp1s0f0np0"
 
 engram_disk = true
@@ -249,9 +256,15 @@ Useful cluster-file fields:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `timeout_seconds` | `900` | Per-rank launch and preflight budget. Raise it: a TP4 load from disk is slow. |
+| `timeout_seconds` | `900` | Wall-clock budget for the **entire** rank application, enforced by a `timeout` wrapper. This is the run deadline, not a startup budget. |
+| `collective_timeout_seconds` | `min(1800, timeout_seconds)` | Process-group collective timeout. Kept separate so a multi-day run still fails fast on a hung collective. Must not exceed `timeout_seconds`. |
 | `engram_disk_threads` | `32` | Size of the shared Engram read pool. |
 | `engram_disk_chunk` | `16` | Rows per read task, capped for prefill-sized batches. |
+
+For a staged rollout that starts at 5 trials and scales to 200, see
+[`STAGED_RUN_PLAN.md`](STAGED_RUN_PLAN.md). It covers the per-stage timeout
+values and two non-obvious constraints of the cluster path (settings are locked
+into the study on the first run, and there is no TTY to answer prompts).
 
 ---
 

@@ -98,7 +98,9 @@ def main(argv: list[str] | None = None) -> int:
         init_method="env://",
         rank=rank_environment.rank,
         world_size=rank_environment.world_size,
-        timeout=timedelta(seconds=rank_environment.timeout_seconds),
+        # The collective timeout is deliberately separate from the run deadline:
+        # a multi-day run still needs a hung collective to fail quickly.
+        timeout=timedelta(seconds=rank_environment.collective_timeout_seconds),
     )
 
     coordinator_runtime = None

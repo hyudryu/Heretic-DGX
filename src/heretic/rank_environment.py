@@ -19,6 +19,7 @@ class RankEnvironment:
     backend: Literal["nccl"]
     timeout_seconds: int
     nccl_socket_ifname: str | None
+    collective_timeout_seconds: int = 900
     engram_disk: bool = False
     engram_directory: str | None = None
     engram_threads: int = 32
@@ -78,6 +79,19 @@ def read_rank_environment(values: Mapping[str, str]) -> RankEnvironment:
     if timeout_seconds <= 0:
         raise ValueError("HERETIC_DGX_TIMEOUT_SECONDS must be positive")
 
+    collective_timeout_seconds = _integer(
+        values,
+        "HERETIC_DGX_COLLECTIVE_TIMEOUT_SECONDS",
+        default=min(1800, timeout_seconds),
+    )
+    if collective_timeout_seconds <= 0:
+        raise ValueError("HERETIC_DGX_COLLECTIVE_TIMEOUT_SECONDS must be positive")
+    if collective_timeout_seconds > timeout_seconds:
+        raise ValueError(
+            "HERETIC_DGX_COLLECTIVE_TIMEOUT_SECONDS must not exceed "
+            "HERETIC_DGX_TIMEOUT_SECONDS"
+        )
+
     nccl_socket_ifname = values.get("NCCL_SOCKET_IFNAME")
     if nccl_socket_ifname is not None and (
         type(nccl_socket_ifname) is not str or not nccl_socket_ifname.strip()
@@ -120,6 +134,7 @@ def read_rank_environment(values: Mapping[str, str]) -> RankEnvironment:
         backend="nccl",
         timeout_seconds=timeout_seconds,
         nccl_socket_ifname=nccl_socket_ifname,
+        collective_timeout_seconds=collective_timeout_seconds,
         engram_disk=engram_disk,
         engram_directory=engram_directory,
         engram_threads=engram_threads,

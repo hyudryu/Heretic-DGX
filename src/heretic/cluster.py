@@ -23,6 +23,12 @@ class ClusterConfig:
     The topology is one rank per node, ordered by rank: index 0 is the
     coordinator. Two nodes is the original validated configuration; four nodes
     is the TP4 configuration used for DeepSeek V4.1 Flash.
+
+    ``timeout_seconds`` bounds the *entire* rank application -- it is enforced
+    both by a local ``timeout`` wrapper and by the launching subprocess -- so it
+    is the run deadline, not a startup budget. ``collective_timeout_seconds`` is
+    the separate process-group collective timeout: a long run needs a large
+    deadline but must still fail fast when a collective genuinely hangs.
     """
 
     nodes: tuple[ClusterNode, ...]
@@ -31,6 +37,10 @@ class ClusterConfig:
     backend: str = "nccl"
     master_port: int = 29500
     timeout_seconds: int = 900
+    # Defaults to min(1800, timeout_seconds) when the TOML omits it, so short
+    # configurations keep their previous effective behavior and long runs get a
+    # bounded collective timeout without having to say so.
+    collective_timeout_seconds: int = 900
     nccl_socket_ifname: str | None = None
     engram_disk: bool = False
     engram_disk_path: str | None = None
@@ -103,6 +113,27 @@ def load_cluster_config(path: str | Path) -> ClusterConfig:
     if timeout_seconds <= 0:
         raise ValueError("DGX cluster field 'timeout_seconds' must be positive")
 
+    raw_collective_timeout = data.get("collective_timeout_seconds")
+    if raw_collective_timeout is None:
+        collective_timeout_seconds = min(1800, timeout_seconds)
+    else:
+        if not isinstance(raw_collective_timeout, int) or isinstance(
+            raw_collective_timeout, bool
+        ):
+            raise ValueError(
+                "DGX cluster field 'collective_timeout_seconds' must be an integer"
+            )
+        collective_timeout_seconds = raw_collective_timeout
+    if collective_timeout_seconds <= 0:
+        raise ValueError(
+            "DGX cluster field 'collective_timeout_seconds' must be positive"
+        )
+    if collective_timeout_seconds > timeout_seconds:
+        raise ValueError(
+            "DGX cluster field 'collective_timeout_seconds' must not exceed "
+            "'timeout_seconds'; a collective cannot outlive the run deadline"
+        )
+
     nccl_socket_ifname = data.get("nccl_socket_ifname")
     if nccl_socket_ifname is not None and (
         not isinstance(nccl_socket_ifname, str) or not nccl_socket_ifname.strip()
@@ -152,6 +183,7 @@ def load_cluster_config(path: str | Path) -> ClusterConfig:
         backend=backend,
         master_port=master_port,
         timeout_seconds=timeout_seconds,
+        collective_timeout_seconds=collective_timeout_seconds,
         nccl_socket_ifname=nccl_socket_ifname,
         engram_disk=engram_disk,
         engram_disk_path=engram_disk_path,

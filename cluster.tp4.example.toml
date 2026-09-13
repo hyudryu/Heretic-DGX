@@ -30,8 +30,27 @@ workdir = "/opt/heretic-dgx"
 backend = "nccl"
 master_port = 29500
 
-# Generous, because the first load of a TP4 checkpoint from disk is slow.
-timeout_seconds = 3600
+# --- Timeouts ---------------------------------------------------------------
+#
+# timeout_seconds bounds the ENTIRE rank application, not just startup. Every
+# rank is launched wrapped in coreutils `timeout`, and the launching process
+# enforces the same deadline, so this is the wall-clock budget for the whole
+# optimization run. When it expires the rank is terminated (SIGTERM, then
+# SIGKILL after 5s).
+#
+# That makes it the natural stage gate for a long run: completed Optuna trials
+# are persisted, so the next run resumes from where this one stopped.
+#
+# 604800 = 7 days, sized for a full 200-trial run. See docs/STAGED_RUN_PLAN.md
+# for the per-stage values (a first 5-trial smoke test does not need 7 days).
+timeout_seconds = 604800
+
+# The process-group collective timeout. Deliberately separate from the run
+# deadline above: a multi-day run still needs a genuinely hung NCCL collective
+# to fail in minutes, not days. Must not exceed timeout_seconds.
+#
+# 1800 = 30 minutes, which is ample for NCCL rendezvous even over a mesh.
+collective_timeout_seconds = 1800
 
 # The fabric interface used for NCCL traffic (not the management path). On a
 # four-node Spark cluster this is the high-speed interconnect, for example

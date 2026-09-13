@@ -100,6 +100,9 @@ def build_rank_launch_plans(
             "HERETIC_DGX_BACKEND": config.backend,
             "HERETIC_DGX_ROLE": role,
             "HERETIC_DGX_TIMEOUT_SECONDS": str(config.timeout_seconds),
+            "HERETIC_DGX_COLLECTIVE_TIMEOUT_SECONDS": str(
+                config.collective_timeout_seconds
+            ),
             "HF_DEACTIVATE_ASYNC_LOAD": "1",
             "LOCAL_RANK": "0",
             "MASTER_ADDR": config.master_address,

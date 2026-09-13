@@ -188,6 +188,73 @@ rank_address = "10.10.10.2"
         with self.assertRaisesRegex(ValueError, "engram_disk_path"):
             load_cluster_config(cluster_file)
 
+    def _timeout_cluster(self, name: str, body: str):
+        cluster_file = self.root / name
+        cluster_file.write_text(
+            'python = "/python"\nworkdir = "/work"\n'
+            + body
+            + '[[nodes]]\nhost = "a"\nrank_address = "10.0.0.1"\n'
+            '[[nodes]]\nhost = "b"\nrank_address = "10.0.0.2"\n',
+            encoding="utf-8",
+        )
+        return load_cluster_config(cluster_file)
+
+    def test_collective_timeout_defaults_within_the_run_deadline(self) -> None:
+        """A short run keeps the previous effective behavior; a long run is bounded."""
+
+        short = self._timeout_cluster("cluster-short.toml", "timeout_seconds = 900\n")
+        self.assertEqual(short.timeout_seconds, 900)
+        self.assertEqual(short.collective_timeout_seconds, 900)
+
+        # A multi-day run must not inherit a multi-day collective timeout.
+        long = self._timeout_cluster("cluster-long.toml", "timeout_seconds = 604800\n")
+        self.assertEqual(long.timeout_seconds, 604800)
+        self.assertEqual(long.collective_timeout_seconds, 1800)
+
+    def test_collective_timeout_is_configurable_and_plumbed_to_ranks(self) -> None:
+        config = self._timeout_cluster(
+            "cluster-explicit-collective.toml",
+            "timeout_seconds = 604800\ncollective_timeout_seconds = 120\n",
+        )
+        self.assertEqual(config.collective_timeout_seconds, 120)
+
+        plans = build_rank_launch_plans(
+            config, ("model",), entry_module="entry", seed=1
+        )
+        environments = [
+            read_rank_environment(plan.environment_dict()) for plan in plans
+        ]
+        self.assertEqual(
+            [environment.timeout_seconds for environment in environments],
+            [604800, 604800],
+        )
+        self.assertEqual(
+            [environment.collective_timeout_seconds for environment in environments],
+            [120, 120],
+        )
+
+    def test_collective_timeout_beyond_the_run_deadline_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            self._timeout_cluster(
+                "cluster-bad-collective.toml",
+                "timeout_seconds = 600\ncollective_timeout_seconds = 900\n",
+            )
+
+    def test_rank_environment_rejects_a_collective_timeout_beyond_the_deadline(
+        self,
+    ) -> None:
+        config = self._timeout_cluster(
+            "cluster-env-collective.toml", "timeout_seconds = 900\n"
+        )
+        plans = build_rank_launch_plans(
+            config, ("model",), entry_module="entry", seed=1
+        )
+        environment = dict(plans[0].environment_dict())
+        environment["HERETIC_DGX_COLLECTIVE_TIMEOUT_SECONDS"] = "99999"
+
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            read_rank_environment(environment)
+
     def test_identities_change_with_source_and_checkpoint_bytes(self) -> None:
         source_root = self.root / "source"
         checkpoint_root = self.root / "checkpoint"

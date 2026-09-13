@@ -15,7 +15,11 @@ python = "/opt/heretic-dgx/.venv/bin/python"
 workdir = "/opt/heretic-dgx"
 backend = "nccl"
 master_port = 29500
+# Bounds the entire rank application, not just startup. See
+# docs/STAGED_RUN_PLAN.md and cluster.tp4.example.toml.
 timeout_seconds = 900
+# Process-group collective timeout, kept separate from the run deadline.
+collective_timeout_seconds = 900
 nccl_socket_ifname = "<fabric-interface>"
 
 [[nodes]]
