@@ -209,39 +209,45 @@ class HttpVllmTransport:
         temperature: float,
         lora_name: str | None,
     ) -> list[GenerationResult]:
-        body = self._post(
-            "/v1/chat/completions",
-            {
-                "model": self.model_name,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                **self._continuation(messages),
-                **self._extra_body(lora_name),
-            },
-        )
-        choices = body.get("choices")
-        if not isinstance(choices, list) or len(choices) != len(messages):
-            raise BackendUnavailable(
-                "vLLM returned an unexpected number of completions: "
-                f"expected {len(messages)}, got "
-                f"{len(choices) if isinstance(choices, list) else 'none'}"
-            )
+        # The OpenAI chat surface takes exactly ONE conversation per request:
+        # `messages` must be a flat list of message objects, not a batch. Heretic
+        # hands us a batch, so fan out. (Verified against the live deployment:
+        # sending a list of conversations is rejected with HTTP 400 and
+        # "Input should be a valid dictionary".)
         results: list[GenerationResult] = []
-        for choice in sorted(choices, key=lambda item: item.get("index", 0)):
-            message = choice.get("message")
-            text = message.get("content") if isinstance(message, dict) else None
-            if not isinstance(text, str):
-                raise BackendUnavailable("vLLM chat completion is missing content")
-            token_ids: tuple[int, ...] = ()
-            token_ids_raw = choice.get("token_ids")
-            if isinstance(token_ids_raw, list):
-                token_ids = tuple(int(token) for token in token_ids_raw)
-            results.append(GenerationResult(text=text, token_ids=token_ids))
+        for conversation in messages:
+            body = self._post(
+                "/v1/chat/completions",
+                {
+                    "model": self.model_name,
+                    "messages": conversation,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    **self._continuation(conversation),
+                    **self._extra_body(lora_name),
+                },
+            )
+            results.append(self._read_choice(body))
         return results
 
     @staticmethod
-    def _continuation(messages: list[ChatMessages]) -> dict[str, Any]:
+    def _read_choice(body: dict[str, Any]) -> GenerationResult:
+        choices = body.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise BackendUnavailable("vLLM chat completion returned no choices")
+        choice = min(choices, key=lambda item: item.get("index", 0))
+        message = choice.get("message")
+        text = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(text, str):
+            raise BackendUnavailable("vLLM chat completion is missing content")
+        token_ids: tuple[int, ...] = ()
+        token_ids_raw = choice.get("token_ids")
+        if isinstance(token_ids_raw, list):
+            token_ids = tuple(int(token) for token in token_ids_raw)
+        return GenerationResult(text=text, token_ids=token_ids)
+
+    @staticmethod
+    def _continuation(conversation: ChatMessages) -> dict[str, Any]:
         """Continue an assistant turn when Heretic supplies a response prefix.
 
         Heretic appends ``response_prefix`` so that scoring happens at the point
@@ -250,7 +256,7 @@ class HttpVllmTransport:
         ``continue_final_message``.
         """
 
-        if messages and messages[-1] and messages[-1][-1].get("role") == "assistant":
+        if conversation and conversation[-1].get("role") == "assistant":
             return {"continue_final_message": True, "add_generation_prompt": False}
         return {}
 
@@ -264,19 +270,23 @@ class HttpVllmTransport:
         is rejected by :meth:`_reconstruct_logits`.
         """
 
-        body = self._post(
-            "/v1/chat/completions",
-            {
-                "model": self.model_name,
-                "messages": messages,
-                "max_tokens": 1,
-                "temperature": 0,
-                "logprobs": -1,
-                **self._continuation(messages),
-                **self._extra_body(lora_name),
-            },
-        )
-        return self._reconstruct_logits(body, len(messages))
+        # One request per conversation, as the chat surface requires.
+        blocks: list[Tensor] = []
+        for conversation in messages:
+            body = self._post(
+                "/v1/chat/completions",
+                {
+                    "model": self.model_name,
+                    "messages": conversation,
+                    "max_tokens": 1,
+                    "temperature": 0,
+                    "logprobs": -1,
+                    **self._continuation(conversation),
+                    **self._extra_body(lora_name),
+                },
+            )
+            blocks.append(self._reconstruct_logits(body, 1))
+        return torch.cat(blocks, dim=0) if blocks else torch.empty(0)
 
     def _reconstruct_logits(self, body: dict[str, Any], batch: int) -> Tensor:
         """Rebuild a dense ``(batch, vocab)`` tensor in token-ID order.
@@ -335,29 +345,35 @@ class HttpVllmTransport:
         layer_ids: tuple[int, ...],
         lora_name: str | None,
     ) -> Tensor:
-        body = self._post(
-            self.capture_layer_path,
-            {
-                "model": self.model_name,
-                "messages": messages,
-                "layer_ids": list(layer_ids),
-                "position": "last",
-                **self._extra_body(lora_name),
-            },
-        )
-        states = body.get("hidden_states")
-        if not isinstance(states, list) or len(states) != len(messages):
-            raise BackendUnavailable(
-                "hidden-state endpoint returned an unexpected batch size"
+        # One request per conversation, as the chat surface requires.
+        blocks: list[Tensor] = []
+        for conversation in messages:
+            body = self._post(
+                self.capture_layer_path,
+                {
+                    "model": self.model_name,
+                    "messages": conversation,
+                    "layer_ids": list(layer_ids),
+                    "position": "last",
+                    **self._extra_body(lora_name),
+                },
             )
-        per_prompt = [torch.tensor(row, dtype=torch.float32) for row in states]
-        stacked = torch.stack(per_prompt)
-        if stacked.dim() != 3 or stacked.shape[1] != len(layer_ids):
-            raise BackendUnavailable(
-                "hidden-state endpoint must return (batch, layers, dim); got "
-                f"{tuple(stacked.shape)} for {len(layer_ids)} requested layers"
-            )
-        return stacked
+            states = body.get("hidden_states")
+            if not isinstance(states, list) or len(states) != 1:
+                raise BackendUnavailable(
+                    "hidden-state endpoint must return one entry per request"
+                )
+            per_prompt = [torch.tensor(row, dtype=torch.float32) for row in states]
+            block = torch.stack(per_prompt)
+            if block.dim() != 3 or block.shape[1] != len(layer_ids):
+                raise BackendUnavailable(
+                    "hidden-state endpoint must return (batch, layers, dim); got "
+                    f"{tuple(block.shape)} for {len(layer_ids)} requested layers"
+                )
+            blocks.append(block)
+        if not blocks:
+            return torch.empty(0)
+        return torch.cat(blocks, dim=0)
 
     def load_lora(self, name: str, path: Path) -> None:
         self._post(

@@ -589,23 +589,58 @@ class TestChatSurface(unittest.TestCase):
     def test_continuation_is_requested_for_a_response_prefix(self) -> None:
         from heretic.deepseek_v41_runtime import HttpVllmTransport
 
-        messages = [
-            [
-                {"role": "system", "content": "s"},
-                {"role": "user", "content": "u"},
-                {"role": "assistant", "content": "Answer: "},
-            ]
+        conversation = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {"role": "assistant", "content": "Answer: "},
         ]
         self.assertEqual(
-            HttpVllmTransport._continuation(messages),
+            HttpVllmTransport._continuation(conversation),
             {"continue_final_message": True, "add_generation_prompt": False},
         )
 
     def test_no_continuation_without_an_assistant_turn(self) -> None:
         from heretic.deepseek_v41_runtime import HttpVllmTransport
 
-        messages = [[{"role": "user", "content": "u"}]]
-        self.assertEqual(HttpVllmTransport._continuation(messages), {})
+        conversation = [{"role": "user", "content": "u"}]
+        self.assertEqual(HttpVllmTransport._continuation(conversation), {})
+
+    def test_one_request_per_conversation(self) -> None:
+        """The chat surface rejects a batch: `messages` must be a flat list."""
+
+        from heretic.deepseek_v41_runtime import HttpVllmTransport
+
+        transport = HttpVllmTransport("http://127.0.0.1:8002", "deepseek-v4.1-flash")
+        captured: list[tuple[str, dict]] = []
+
+        def fake_post(path, payload):
+            captured.append((path, payload))
+            return {
+                "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": "ok"}}
+                ]
+            }
+
+        transport._post = fake_post  # type: ignore[method-assign]
+        results = transport.generate(
+            [
+                [{"role": "user", "content": "a"}],
+                [{"role": "user", "content": "b"}],
+                [{"role": "user", "content": "c"}],
+            ],
+            max_tokens=4,
+            temperature=0.0,
+            lora_name=None,
+        )
+
+        self.assertEqual(len(results), 3)
+        self.assertEqual(len(captured), 3)
+        for _, payload in captured:
+            # A flat list of message dicts, never a list of conversations.
+            self.assertIsInstance(payload["messages"], list)
+            self.assertTrue(payload["messages"])
+            self.assertIsInstance(payload["messages"][0], dict)
+            self.assertIn("role", payload["messages"][0])
 
     def test_chat_completion_body_is_parsed(self) -> None:
         from heretic.deepseek_v41_runtime import HttpVllmTransport
