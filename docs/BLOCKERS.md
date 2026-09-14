@@ -11,19 +11,27 @@ just cannot execute until blocker 1 is resolved.
 
 ## Summary
 
-| # | Blocker | Whose problem | Fixable here? |
-|---|---|---|---|
-| 1 | `transformers` has no `deepseek_v41` implementation — at any version | upstream | **No** |
-| 2 | `transformers` has no Engram support at all | upstream | No |
-| 3 | Heretic's Engram disk offload is defined but never wired into the load path | **this repo** | Yes, but pointless until 1 is fixed |
-| 4 | The standalone export is hard-coded to Laguna S 2.1 FP8 (48 layers) | **this repo** | Yes, but pointless until 1 is fixed |
-| 5 | The checkpoint ships no chat template | upstream | Workaroundable |
+> **Update: DeepSeek V4.1 Flash is now supported through a native vLLM backend
+> that bypasses `transformers` entirely.** See
+> [`DEEPSEEK_V41_BACKEND.md`](DEEPSEEK_V41_BACKEND.md). Blockers 1, 2 and 5 are
+> routed around rather than fixed: Heretic no longer requires a `transformers`
+> model in order to run. Blockers 3 and 4 still stand, and the backend is not yet
+> validated end to end because no vLLM deployment was reachable when it was
+> written.
 
-Blockers 1 and 2 are fatal and outside this repository's control. Heretic loads
-models exclusively through `transformers` (`AutoConfig`,
-`AutoModelForCausalLM` / `AutoModelForImageTextToText`, `AutoTokenizer`,
-`generate()`), so with no implementation of the architecture there is no load
-path at all.
+| # | Blocker | Whose problem | Status |
+|---|---|---|---|
+| 1 | `transformers` has no `deepseek_v41` implementation — at any version | upstream | **Bypassed**: the vLLM backend never asks `transformers` for the model |
+| 2 | `transformers` has no Engram support at all | upstream | **Bypassed**: vLLM owns Engram |
+| 3 | Heretic's Engram disk offload is defined but never wired into the load path | **this repo** | Still inert; **not used** by the V4.1 backend |
+| 4 | The standalone export is hard-coded to Laguna S 2.1 FP8 (48 layers) | **this repo** | Still stands; V4.1 exports adapters only and refuses merged export |
+| 5 | The checkpoint ships no chat template | upstream | **Bypassed**: vLLM's `tokenizer_mode="deepseek_v41"` owns prompt encoding |
+
+Blockers 1 and 2 are fatal to the **Transformers** route and outside this
+repository's control. That route is unchanged and still cannot load this model.
+The V4.1 backend exists precisely so that Heretic's optimization loop does not
+depend on it.
+
 
 ---
 
