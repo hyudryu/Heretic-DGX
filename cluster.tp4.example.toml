@@ -2,7 +2,7 @@
 #
 # Four nodes, one NCCL rank each, for models that do not fit on two Sparks --
 # specifically DeepSeek V4.1 Flash, whose transformer weights need TP4 and
-# whose Engram n-gram tables (1.573e12 parameters, ~1.43 TiB in fp8) stay on
+# whose Engram n-gram tables (189.1 GiB in fp8, 47.3 GiB per rank) stay on
 # the SSD.
 #
 # Copy outside the repository, fill in real values, and do not commit it.
@@ -60,13 +60,17 @@ nccl_socket_ifname = "<fabric-interface>"
 # --- Engram (n-gram) tables on disk ----------------------------------------
 #
 # DeepSeek V4.1 Flash keeps its n-gram hash tables on the SSD instead of in
-# memory. This is what makes TP4 viable: the tables are ~1.43 TiB in total,
-# and each rank would otherwise need ~366 GiB resident.
+# memory. This is what makes TP4 viable: the tables are 189.1 GiB in total
+# (47.3 GiB per rank), on top of a 71.5 GiB-per-rank backbone, against 128 GB
+# of unified memory per node shared with the host.
 #
-# engram_disk_path must point at the extracted Hugging Face checkpoint
-# directory -- the one containing `model.safetensors.index.json` and the
-# `model-*-of-*.safetensors` shards -- at the same absolute path on all four
-# nodes. The tables are opened O_RDONLY and never written.
+# engram_disk_path must point at a directory holding `config.json`,
+# `model.safetensors.index.json` and the `model-*-of-*.safetensors` shards, at
+# the same absolute path on all four nodes. Every one of those entries must be
+# a REGULAR FILE: Heretic's preflight refuses symlinks (it opens checkpoint
+# payloads with O_NOFOLLOW), so a Hugging Face cache `snapshots/` directory
+# cannot be used directly -- see docs/TP4.md section 5. The tables are opened
+# O_RDONLY and never written.
 engram_disk = true
 engram_disk_path = "/models/DeepSeek-V4.1-Flash"
 engram_disk_threads = 32

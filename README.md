@@ -40,17 +40,18 @@ to the DGX implementation belong in this repository.
 
 ## DeepSeek V4.1 Flash and Engram on disk
 
-DeepSeek V4.1 Flash carries two Engram n-gram hash tables (layers 1 and 14) of
-1.573e12 parameters — about **1.43 TiB** in the checkpoint's fp8 form. A DGX
-Spark has 128 GB of unified memory, so those tables fit on no tensor-parallel
-degree this project targets: at TP4 each rank would still need ~366 GiB.
+DeepSeek V4.1 Flash carries two Engram n-gram hash tables (layers 1 and 14).
+Measured from the released checkpoint they are **189.1 GiB** of fp8 data —
+**47.3 GiB per rank at TP4** — on top of a 71.5 GiB-per-rank MoE backbone. A
+DGX Spark has 128 GB of unified memory shared with the host, so holding both
+would leave no headroom for activations or residual tensors.
 
 With `engram_disk = true` the tables stay on the SSD and are read on demand, so
 only the transformer weights occupy memory. The tables are opened read-only
 (`O_RDONLY` + `POSIX_FADV_RANDOM`) and are never modified.
 
 This is practical because each rank reads only its own row range (~47 GiB at
-TP4, not 1.43 TiB), the whole forward's hash ids are gathered in one batch, and
+TP4, not 189 GiB), the whole forward's hash ids are gathered in one batch, and
 rows are de-duplicated before reading. It is a port of the mechanism used by
 the working vLLM DGX Spark deployment, without the vLLM dependency.
 

@@ -36,14 +36,14 @@ rank_address = "<worker-fabric-address>"
 # DeepSeek V4.1 Flash: Engram (n-gram) tables on disk
 # ---------------------------------------------------------------------------
 #
-# DeepSeek V4.1 Flash carries two Engram n-gram tables (layers 1 and 14) of
-# 1.573e12 parameters total -- about 1.43 TiB in the checkpoint's fp8 form.
-# A DGX Spark has 128 GB of unified memory, so those tables do not fit on any
-# tensor-parallel degree this project targets. With `engram_disk = true` they
-# stay on the SSD and rows are read on demand, so only the transformer weights
-# occupy memory.
+# DeepSeek V4.1 Flash carries two Engram n-gram tables (layers 1 and 14),
+# measured at 189.1 GiB of fp8 data in total -- 47.3 GiB per rank at TP4, on
+# top of a 71.5 GiB-per-rank backbone. A DGX Spark has 128 GB of unified
+# memory shared with the host, so holding both leaves no headroom. With
+# `engram_disk = true` they stay on the SSD and rows are read on demand, so
+# only the transformer weights occupy memory.
 #
-# This requires the extracted Hugging Face checkpoint (the directory holding
+# This requires an extracted Hugging Face checkpoint (the directory holding
 # `model.safetensors.index.json` and its shards) at the same absolute path on
 # every node. The tables are opened read-only (O_RDONLY + POSIX_FADV_RANDOM)
 # and are never written.

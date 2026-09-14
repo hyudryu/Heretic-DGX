@@ -38,8 +38,8 @@ whole design:
 fits across four 128 GB unified-memory nodes. This is what the N-node change
 in this repository enables.
 
-**The Engram n-gram tables do not fit at all.** V4.1 Flash adds Engram layers
-at layer 1 and layer 14. From the released `config.json`:
+**The Engram n-gram tables are too large to co-reside.** V4.1 Flash adds Engram
+layers at layer 1 and layer 14. From the released `config.json`:
 
 | Field | Value |
 |---|---|
@@ -49,9 +49,22 @@ at layer 1 and layer 14. From the released `config.json`:
 | `engram_n_heads` | `8` |
 | `engram_max_ngram_size` | `4` |
 
-That is `(384006168 + 384016682) x 256 x 8` = **1.573e12 parameters**. At the
-checkpoint's fp8 e4m3 storage that is **~1.43 TiB**. Per rank at TP4 it would
-still be **~366 GiB** -- more than twice a single node's entire memory.
+Measuring the released checkpoint directly, each table is `rows x head_dim` in
+fp8 e4m3 plus one ue8m0 scale per 32 columns:
+
+| Tensor | Shape | Bytes |
+|---|---|---|
+| `layers.1.engram.embed.weight` | `[384006168, 256]` | 91.6 GiB |
+| `layers.14.engram.embed.weight` | `[384016682, 256]` | 91.6 GiB |
+| `layers.{1,14}.engram.embed.scale` | `[rows, 8]` | 2.9 GiB each |
+
+That is **189.1 GiB** of tables, and **47.3 GiB per rank at TP4**. The MoE
+backbone is a further 307.2 GB, or **71.5 GiB per rank at TP4**.
+
+So a single Spark would need roughly `71.5 + 47.3 = 118.8 GiB` resident out of
+128 GB of unified memory -- which is shared with the host and has to also hold
+activations, the CUDA context, and Heretic's own residual tensors. There is no
+realistic headroom at that margin.
 
 So the tables stay on the SSD. With `engram_disk = true`, only the transformer
 weights are loaded into memory; the Engram tables are read row-by-row from the
@@ -59,12 +72,12 @@ safetensors shards on demand.
 
 ### Why that is fast enough
 
-The naive reading -- "1.43 TiB on SSD means a disk read per lookup" -- would be
+The naive reading -- "189 GiB on SSD means a disk read per lookup" -- would be
 far too slow. Two properties of the real access pattern make it work:
 
-1. **Only this rank's rows are ever read.** The checker stores each layer's
-   full table, but a rank looks up only its own head range, so rank *r* of 4
-   reads ~47 GiB of rows, not 1.43 TiB.
+1. **Only this rank's rows are ever read.** The checkpoint stores each layer's
+   full table, but a rank looks up only its own row range, so rank *r* of 4
+   reads ~47 GiB of rows, not 189 GiB.
 
 2. **Lookups are batched and repeat heavily.** Engram hashes each position into
    `(max_ngram_size - 1) x n_heads = 24` bucket ids, but the whole forward's
@@ -183,8 +196,7 @@ traffic path (`rank_address`) exactly so you can do this.
 
 ## 5. Checkpoint layout
 
-`engram_disk_path` must point at the **extracted Hugging Face checkpoint
-directory**, i.e. the one containing:
+`engram_disk_path` must point at a directory containing:
 
 ```
 model.safetensors.index.json
@@ -197,25 +209,69 @@ tokenizer.json
 
 The Engram reader resolves tensor locations from
 `model.safetensors.index.json` -> `weight_map`, then reads the tensor's
-`data_offsets` from that shard's safetensors header. It expects the two tensors:
+`data_offsets` from that shard's safetensors header. It expects:
 
 ```
-layers.1.engram.embed.weight     # rows x head_dim, F8_E4M3
-layers.1.engram.embed.scale      # rows x (head_dim / 32), F8_E8M0
-layers.14.engram.embed.weight
-layers.14.engram.embed.scale
+layers.1.engram.embed.weight     # [384006168, 256],  F8_E4M3, 91.6 GiB
+layers.1.engram.embed.scale      # [384006168, 8],    F8_E8M0,  2.9 GiB
+layers.14.engram.embed.weight    # [384016682, 256],  F8_E4M3, 91.6 GiB
+layers.14.engram.embed.scale     # [384016682, 8],    F8_E8M0,  2.9 GiB
 ```
 
-Notes:
+### Every entry must be a regular file, not a symlink
+
+This is the trap when the model is already in the Hugging Face cache. A cache
+`snapshots/<commit>/` directory contains **only symlinks** into `blobs/`, and
+Heretic's preflight rejects them:
+
+- `checkpoint_identity._read_json_object` uses `lstat()` and requires
+  `S_ISREG`, so `config.json` fails with
+  *"checkpoint metadata must be a regular file"*.
+- `_hash_regular_file` additionally opens with `O_NOFOLLOW`.
+
+That check is deliberate -- it stops a symlink being swapped between the
+identity hash and the load -- so the fix is to materialise the layout rather
+than to relax it.
+
+**Hard links are the right fix**, because they are real directory entries
+(`S_ISREG`) sharing the same inode, so they cost no additional disk space:
+
+```sh
+REPO="$HOME/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash"
+SNAP="$REPO/snapshots/$(cat "$REPO/refs/main")"
+sudo mkdir -p /models/DeepSeek-V4.1-Flash
+sudo chown "$USER:$USER" /models/DeepSeek-V4.1-Flash
+for f in "$SNAP"/*; do
+  ln -f "$(readlink -f "$f")" "/models/DeepSeek-V4.1-Flash/$(basename "$f")"
+done
+```
+
+This works because the cache and `/models` are on the same filesystem, which is
+true on all four nodes here (`/dev/nvme0n1p2`). Hard-linking across filesystems
+fails, and copying is not an option: the checkpoint is 475 GiB and the smallest
+node has ~19 GB free.
+
+Verify before running:
+
+```sh
+find /models/DeepSeek-V4.1-Flash -maxdepth 1 -type l | wc -l   # expect 0
+ls /models/DeepSeek-V4.1-Flash/config.json                     # regular file
+```
+
+### Other notes
 
 - This is the **Hugging Face** checkpoint, not a `convert.py`-style
   `model{rank}-mp4.safetensors` TP4 conversion. The reader derives each rank's
   row range itself from the full-table tensor.
-- Keeping this directory on local NVMe on every node matters a great deal. If
-  it lives on NFS, every rank's row reads cross the network, and the page cache
-  that makes this fast (on GB10, unified memory) is shared with the GPU pool.
+- Keep this directory on local NVMe on every node. If it lives on NFS, every
+  rank's row reads cross the network, and the page cache that makes this fast
+  (on GB10, unified memory) is shared with the GPU pool.
 - Row reads are positional (`preadv`) and page-cache friendly; the working set
   is small because of the de-duplication.
+- **Expect the preflight to be slow.** It hashes every payload file, so each
+  run reads the full 475 GiB checkpoint once per node, and ranks are
+  preflighted sequentially over SSH. That is minutes, not seconds, on every
+  run including each staged resume.
 
 ---
 

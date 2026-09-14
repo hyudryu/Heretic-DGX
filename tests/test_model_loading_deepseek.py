@@ -108,8 +108,8 @@ class TestEngramOffloadPlan(unittest.TestCase):
         )
         self.assertEqual([layout.row_start for layout in plan.layouts], [0, 0])
 
-        # The rank-local footprint is ~47 GiB, versus ~1.43 TiB for the whole
-        # table: this is the whole reason disk mode is viable.
+        # The rank-local footprint is ~47 GiB, versus ~189 GiB for both tables
+        # in full: this is the whole reason disk mode is viable.
         gib = plan.resident_bytes_avoided / 1024**3
         self.assertGreater(gib, 45.0)
         self.assertLess(gib, 50.0)

@@ -3,10 +3,21 @@
 """Read-only, disk-backed Engram (n-gram) tables for DeepSeek V4.1 Flash.
 
 DeepSeek V4.1 Flash carries two Engram n-gram hash tables (layers 1 and 14).
-Together they hold 1.573e12 parameters, which is about 1.43 TiB stored in the
-checkpoint's fp8 e4m3 form. A DGX Spark has 128 GB of unified memory, so the
-tables cannot be resident on any tensor-parallel degree this project targets:
-at TP4 the backbone alone consumes the four nodes' memory budget.
+Measured from the released checkpoint, each is ``rows x head_dim`` in fp8 e4m3
+plus one ue8m0 scale per 32 columns:
+
+    layers.1.engram.embed.weight   [384006168, 256]  fp8    91.6 GiB
+    layers.14.engram.embed.weight  [384016682, 256]  fp8    91.6 GiB
+    (+ scales, 2.9 GiB each)
+
+Together that is **189.1 GiB** on disk, or **47.3 GiB per rank at TP4**. The
+rest of the checkpoint (the MoE backbone) is a further 307.2 GB, or 71.5 GiB
+per rank at TP4.
+
+A DGX Spark has 128 GB of unified memory, shared between host and GPU. Fitting
+the backbone and the tables together would need ~118.8 GiB per node, leaving no
+headroom for activations, the CUDA context, or Heretic's own residual tensors --
+so the tables are kept off the GPU entirely.
 
 This module keeps those tables on the SSD and reads rows from the safetensors
 shards on demand. It is a port of the Engram-on-disk patch used by the vLLM
@@ -16,14 +27,14 @@ needs and without the vLLM runtime dependency.
 Why this works despite the size
 -------------------------------
 
-The naive reading of "1.43 TiB on SSD" is that every lookup becomes a random
+The naive reading of "189 GiB on SSD" is that every lookup becomes a random
 disk read, which would be far too slow. Two properties of the real access
 pattern make it tractable:
 
 1. **The table is row-sharded by tensor parallelism.** The checkpoint stores
-   each layer's full table, but a rank only ever looks up its own head range,
+   each layer's full table, but a rank only ever looks up its own row range,
    so rank *r* of *N* reads only ``ceil(rows / N)`` rows -- about 47 GiB at
-   TP4, not 1.43 TiB.
+   TP4, not 189 GiB.
 
 2. **Lookups are batched and heavily repeated.** Engram hashes every position
    into ``(max_ngram_size - 1) * n_heads = 24`` bucket ids, but an entire

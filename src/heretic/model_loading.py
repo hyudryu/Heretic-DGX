@@ -22,9 +22,11 @@ _LAGUNA_DGX_TP_PLAN = {
 }
 
 # DeepSeek V4.1 Flash's Engram tables are what make the model need the cluster
-# in the first place: 1.573e12 parameters, about 1.43 TiB in the checkpoint's
-# fp8 form. They are never ablated, so the disk-backed path replaces them with
-# one-row placeholders and reads rows on demand (see heretic.engram_disk).
+# in the first place: measured from the released checkpoint they are 189.1 GiB
+# on disk (two `rows x 256` fp8 tables plus ue8m0 scales), or 47.3 GiB per rank
+# at TP4, on top of a 71.5 GiB-per-rank backbone. They are never ablated, so the
+# disk-backed path replaces them with one-row placeholders and reads rows on
+# demand (see heretic.engram_disk).
 DEEPSEEK_V41_MODEL_TYPE = "deepseek_v41"
 DEEPSEEK_V41_TEXT_MODEL_TYPE = "deepseek_v41_text"
 _ENGRAM_TENSOR_SUFFIXES = (".engram.embed.weight", ".engram.embed.scale")
