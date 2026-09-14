@@ -11,7 +11,6 @@ from typing import Any, Type, cast
 import bitsandbytes as bnb
 import torch
 import torch.distributed as dist
-import torch.linalg as LA
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from peft.tuners.lora.layer import Linear
@@ -36,6 +35,7 @@ from transformers.generation import (
     GenerateDecoderOnlyOutput,  # ty:ignore[possibly-missing-import]
 )
 
+from .abliteration_math import compute_directional_lora, layer_ablation_weight
 from .config import QuantizationMethod, RowNormalization, Settings
 from .model_loading import build_model_load_kwargs, complete_laguna_dgx_tp_plan
 from .system import empty_cache
@@ -535,24 +535,22 @@ class Model:
             for component, modules in self.get_layer_modules(layer_index).items():
                 params = parameters[component]
 
-                # Type inference fails here for some reason.
-                distance = cast(float, abs(layer_index - params.max_weight_position))
-
-                # Don't orthogonalize layers that are more than
-                # min_weight_distance away from max_weight_position.
-                if distance > params.min_weight_distance:
-                    continue
-
-                # Interpolate linearly between max_weight and min_weight
-                # over min_weight_distance.
-                weight = params.max_weight + (distance / params.min_weight_distance) * (
-                    params.min_weight - params.max_weight
+                # Triangular schedule shared with every other backend, so a
+                # trial means the same thing regardless of how inference runs.
+                weight = layer_ablation_weight(
+                    layer_index,
+                    max_weight=params.max_weight,
+                    max_weight_position=params.max_weight_position,
+                    min_weight=params.min_weight,
+                    min_weight_distance=params.min_weight_distance,
                 )
 
-                # A weight of 0 disables this component's ablation. reset_model() has
-                # already left the adapter at identity, so abort before the otherwise
-                # wasteful decomposition (which would also be operating on a zero matrix).
-                if weight == 0:
+                # None means the layer is further than min_weight_distance away from
+                # max_weight_position. A weight of 0 disables this component's
+                # ablation. reset_model() has already left the adapter at identity,
+                # so abort before the otherwise wasteful decomposition (which would
+                # also be operating on a zero matrix).
+                if weight is None or weight == 0:
                     continue
 
                 if residual_direction is None:
@@ -643,68 +641,25 @@ class Model:
                             weight_B.data = factors.b.to(weight_B.dtype)
                             continue
 
-                    if self.settings.row_normalization == RowNormalization.FULL:
-                        # Keep a reference to the original weight matrix so we can subtract it later.
-                        W_org = W
-
-                    if self.settings.row_normalization != RowNormalization.NONE:
-                        # Get the row norms.
-                        W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
-                        # Normalize the weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
-
-                    # Calculate lora_A = v^T W
-                    # v is (d_out,), W is (d_out, d_in)
-                    # v @ W -> (d_in,)
-                    lora_A = (v @ W).view(1, -1)
-
-                    # Calculate lora_B = -weight * v
-                    # v is (d_out,)
-                    lora_B = (-weight * v).view(-1, 1)
-
-                    if self.settings.row_normalization == RowNormalization.PRE:
-                        # Make the LoRA adapter apply to the original weight matrix.
-                        lora_B = W_row_norms * lora_B
-                    elif self.settings.row_normalization == RowNormalization.FULL:
-                        # Approximates https://huggingface.co/blog/grimjim/norm-preserving-biprojected-abliteration
-                        W = W + lora_B @ lora_A
-                        # Normalize the adjusted weight matrix along the rows.
-                        W = F.normalize(W, p=2, dim=1)
-                        # Restore the original row norms of the weight matrix.
-                        W = W * W_row_norms
-                        # Subtract the original matrix to turn W into a delta.
-                        W = W - W_org
-                        # Use a low-rank SVD to get an approximation of the matrix.
-                        r = self.peft_config.r
-
-                        # svd_lowrank is randomized:
-                        # https://github.com/pytorch/pytorch/blob/20919052303c0b5ba87f8bf7e19237dc33ab09d3/torch/_lowrank.py#L108-L109
-                        # Reseed immediately before the call so restoring a trial is independent of RNG history.
-                        torch.manual_seed(self.settings.seed)
-                        # "It's safe to call this function if CUDA is not available;
-                        # in that case, it is silently ignored."
-                        torch.cuda.manual_seed_all(self.settings.seed)  # ty:ignore[invalid-argument-type]
-                        U, S, Vh = torch.svd_lowrank(W, q=2 * r + 4, niter=6)
-
-                        # Truncate it to the part we want to store in the LoRA adapter.
-                        # Note: svd_lowrank actually returns V, so transpose it to get Vh.
-                        U = U[:, :r]
-                        S = S[:r]
-                        Vh = Vh[:, :r].T
-                        # Transfer it into the LoRA adapter components. Split the singular values
-                        # evenly between the two components to keep their norms balanced and avoid
-                        # potential issues with numerical stability.
-                        sqrt_S = torch.sqrt(S)
-                        lora_B = U @ torch.diag(sqrt_S)
-                        lora_A = torch.diag(sqrt_S) @ Vh
+                    # Backend-independent math. Identical inputs produce identical
+                    # factors here and in the remote vLLM backend, which shares
+                    # this function.
+                    factors = compute_directional_lora(
+                        W,
+                        v,
+                        strength=weight,
+                        normalization=self.settings.row_normalization.value,
+                        rank=self.peft_config.r,
+                        seed=self.settings.seed,
+                    )
 
                     # Assign to adapters. The adapter name is "default", because that's
                     # what PEFT uses when no name is explicitly specified, as above.
                     # These casts are therefore valid.
                     weight_A = cast(Tensor, module.lora_A["default"].weight)
                     weight_B = cast(Tensor, module.lora_B["default"].weight)
-                    weight_A.data = lora_A.to(weight_A.dtype)
-                    weight_B.data = lora_B.to(weight_B.dtype)
+                    weight_A.data = factors.a.to(weight_A.dtype)
+                    weight_B.data = factors.b.to(weight_B.dtype)
 
     def generate(
         self,
