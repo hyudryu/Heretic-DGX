@@ -388,16 +388,17 @@ class TestExactLogits(unittest.TestCase):
         from heretic.deepseek_v41_runtime import HttpVllmTransport
 
         root = Path(temporary)
-        # A tiny vocabulary; the real one is 129280 with no duplicate strings.
-        (root / "tokenizer.json").write_text(
-            json.dumps({"model": {"vocab": {"a": 0, "b": 1, "c": 2}}}),
-            encoding="utf-8",
-        )
+        # vocab_texts is the decode seam: id i decodes to vocab_texts[i].
+        # The real vocabulary has 129280 such texts, decoded from the
+        # checkpoint tokenizer rather than read from its raw BPE keys.
         (root / "config.json").write_text(
             json.dumps({"text_config": {"vocab_size": 5}}), encoding="utf-8"
         )
         return HttpVllmTransport(
-            "http://127.0.0.1:8000", "m", checkpoint_directory=temporary
+            "http://127.0.0.1:8000",
+            "m",
+            checkpoint_directory=temporary,
+            vocab_texts=["a", "b", "c", "d", "e"],
         )
 
     def test_text_keys_are_mapped_to_ids_and_gaps_are_filled(self) -> None:

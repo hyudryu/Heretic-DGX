@@ -92,6 +92,26 @@ ChatMessages = list[dict[str, str]]
 #: every trial, identically.
 IMPOSSIBLE_LOGIT = -1.0e4
 
+
+def decode_token_texts(checkpoint_directory: str | Path) -> list[str]:
+    """Decode every token id to the text the engine uses as a logprobs key.
+
+    One batched call into the Rust tokenizer. ``skip_special_tokens=False``
+    because the engine keys special tokens by their literal text too.
+    """
+
+    from tokenizers import Tokenizer  # noqa: PLC0415 - optional dependency path
+
+    path = Path(checkpoint_directory) / "tokenizer.json"
+    if not path.is_file():
+        raise BackendUnavailable(f"cannot rebuild token ids without {path}")
+    tokenizer = Tokenizer.from_file(str(path))
+    size = tokenizer.get_vocab_size(with_added_tokens=True)
+    return tokenizer.decode_batch(
+        [[index] for index in range(size)], skip_special_tokens=False
+    )
+
+
 #: Layer whose residual width we validate capture against.
 _PROBE_LAYER = 0
 
@@ -169,6 +189,7 @@ class HttpVllmTransport:
         load_lora_path: str = "/v1/load_lora_adapter",
         unload_lora_path: str = "/v1/unload_lora_adapter",
         checkpoint_directory: str | None = None,
+        vocab_texts: list[str] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
@@ -180,8 +201,12 @@ class HttpVllmTransport:
         # Needed to map returned token text back to ids and to size the dense
         # logit vector. Only the logits path uses it.
         self.checkpoint_directory = checkpoint_directory
+        #: Test seam: pre-decoded token texts, bypassing tokenizer.json.
+        self._vocab_texts = vocab_texts
         self._vocab_size: int | None = None
         self._vocab: dict[str, int] | None = None
+        #: Texts that more than one id decodes to; dropped, never guessed.
+        self._ambiguous_texts = 0
         #: Cumulative count of returned logits whose rendered text did not map
         #: to a token id. Reported rather than hidden.
         self.unmapped_logits = 0
@@ -241,42 +266,44 @@ class HttpVllmTransport:
         return self._vocab_size
 
     def _vocab_map(self) -> dict[str, int]:
-        """Token text -> id, from the checkpoint's ``tokenizer.json``.
+        """Decoded token text -> id.
 
-        Verified 1:1 for this checkpoint: 128000 BPE entries plus 1283 added
-        tokens, no duplicate strings, so every returned token text resolves to
-        exactly one id.
+        The engine keys ``top_logprobs`` by the **decoded** text of a token, not
+        by the raw byte-level BPE key stored in ``tokenizer.json``. Those differ
+        for most of the vocabulary -- the file holds ``ĠThe`` where the engine
+        emits ``" The"`` -- and building the map from the raw keys resolves only
+        about a quarter of what the engine returns. Verified against the live
+        engine: 97452 of 127893 entries failed to map that way.
+
+        So every id is decoded here instead, in one batched Rust call.
+
+        Texts that two ids decode to are dropped rather than guessed at: the
+        engine's own dictionary cannot distinguish them either, and assigning a
+        real logit to the wrong token is worse than leaving both at the sentinel.
         """
 
         if self._vocab is None:
-            if self.checkpoint_directory is None:
-                raise BackendUnavailable(
-                    "cannot rebuild token ids without a checkpoint directory"
-                )
-            path = Path(self.checkpoint_directory) / "tokenizer.json"
-            if not path.is_file():
-                raise BackendUnavailable(f"cannot rebuild token ids without {path}")
-            with path.open("rb") as stream:
-                tokenizer = json.loads(stream.read())
+            if self._vocab_texts is not None:
+                texts = list(self._vocab_texts)
+            else:
+                if self.checkpoint_directory is None:
+                    raise BackendUnavailable(
+                        "cannot rebuild token ids without a checkpoint directory"
+                    )
+                texts = decode_token_texts(self.checkpoint_directory)
 
             mapping: dict[str, int] = {}
-            model = tokenizer.get("model")
-            vocab = model.get("vocab") if isinstance(model, dict) else None
-            if not isinstance(vocab, dict):
-                raise BackendUnavailable("tokenizer.json has no BPE vocabulary")
-            for text, index in vocab.items():
-                if isinstance(text, str) and isinstance(index, int):
-                    mapping.setdefault(text, index)
-            added = tokenizer.get("added_tokens")
-            if isinstance(added, list):
-                for entry in added:
-                    if not isinstance(entry, dict):
-                        continue
-                    content = entry.get("content")
-                    index = entry.get("id")
-                    if isinstance(content, str) and isinstance(index, int):
-                        # Added tokens win: they are what the engine emits.
-                        mapping[content] = index
+            ambiguous: set[str] = set()
+            for index, text in enumerate(texts):
+                if not isinstance(text, str):
+                    continue
+                if text in mapping:
+                    ambiguous.add(text)
+                    continue
+                mapping[text] = index
+            for text in ambiguous:
+                mapping.pop(text, None)
+            self._ambiguous_texts = len(ambiguous)
             self._vocab = mapping
         return self._vocab
 
