@@ -373,53 +373,89 @@ class TestExactLogits(unittest.TestCase):
         self.assertEqual(tuple(logits.shape), (1, 11))
         self.assertEqual(logits.dtype, torch.float32)
 
-    def test_top_k_only_payload_is_rejected(self) -> None:
-        """No silent fallback to a top-K KL divergence."""
+    def test_empty_distribution_points_at_the_real_cause(self) -> None:
+        """logprobs=-1 is accepted by the engine but returns an empty map."""
 
         from heretic.deepseek_v41_runtime import HttpVllmTransport
 
         http = HttpVllmTransport("http://127.0.0.1:8000", "m")
-        body = {
-            "choices": [
-                {
-                    "index": 0,
-                    "logprobs": {
-                        "tokens": ["a"],
-                        "token_logprobs": [-0.5],
-                        "top_logprobs": [{"a": -0.5, "b": -1.0}],
-                    },
-                }
-            ]
-        }
+        body = {"choices": [{"index": 0, "logprobs": {"top_logprobs": [{}]}}]}
         with self.assertRaises(ExactLogitsUnavailable) as caught:
             http._reconstruct_logits(body, 1)
-        self.assertIn("top-K", str(caught.exception))
+        self.assertIn("logprobs=<vocab_size>", str(caught.exception))
 
-    def test_dense_payload_is_accepted_and_ordered(self) -> None:
+    def _transport(self, temporary: str) -> object:
         from heretic.deepseek_v41_runtime import HttpVllmTransport
 
-        http = HttpVllmTransport("http://127.0.0.1:8000", "m")
-        body = {
-            "vocab_size": 3,
-            "choices": [
-                {"index": 0, "logprobs": {"raw_logits": [1.0, 2.0, 3.0]}},
-                {"index": 1, "logprobs": {"raw_logits": [4.0, 5.0, 6.0]}},
-            ],
-        }
-        logits = http._reconstruct_logits(body, 2)
-        self.assertEqual(tuple(logits.shape), (2, 3))
-        self.assertTrue(torch.equal(logits[1], torch.tensor([4.0, 5.0, 6.0])))
+        root = Path(temporary)
+        # A tiny vocabulary; the real one is 129280 with no duplicate strings.
+        (root / "tokenizer.json").write_text(
+            json.dumps({"model": {"vocab": {"a": 0, "b": 1, "c": 2}}}),
+            encoding="utf-8",
+        )
+        (root / "config.json").write_text(
+            json.dumps({"text_config": {"vocab_size": 5}}), encoding="utf-8"
+        )
+        return HttpVllmTransport(
+            "http://127.0.0.1:8000", "m", checkpoint_directory=temporary
+        )
 
-    def test_vocabulary_size_mismatch_is_rejected(self) -> None:
-        from heretic.deepseek_v41_runtime import HttpVllmTransport
+    def test_text_keys_are_mapped_to_ids_and_gaps_are_filled(self) -> None:
+        """Returned text keys land at their token ids; omitted ids get a sentinel."""
 
-        http = HttpVllmTransport("http://127.0.0.1:8000", "m")
-        body = {
-            "vocab_size": 5,
-            "choices": [{"index": 0, "logprobs": {"raw_logits": [1.0, 2.0]}}],
-        }
-        with self.assertRaises(ExactLogitsUnavailable):
-            http._reconstruct_logits(body, 1)
+        from heretic.deepseek_v41_runtime import IMPOSSIBLE_LOGIT
+
+        with tempfile.TemporaryDirectory() as temporary:
+            http = self._transport(temporary)
+            body = {
+                "choices": [
+                    {"index": 0, "logprobs": {"top_logprobs": [{"b": 9.0, "a": 3.0}]}}
+                ]
+            }
+            row = http._reconstruct_logits(body, 1)
+
+        self.assertEqual(tuple(row.shape), (1, 5))
+        self.assertEqual(float(row[0, 0]), 3.0)  # "a" -> id 0
+        self.assertEqual(float(row[0, 1]), 9.0)  # "b" -> id 1
+        # ids 2, 3 and 4 were not returned: finite sentinel, never -inf.
+        for index in (2, 3, 4):
+            self.assertEqual(float(row[0, index]), IMPOSSIBLE_LOGIT)
+        self.assertTrue(torch.isfinite(row).all())
+
+    def test_sentinel_does_not_poison_kl(self) -> None:
+        """The whole point: F.kl_div(log_target=True) must not yield NaN."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            http = self._transport(temporary)
+            body = {
+                "choices": [
+                    {"index": 0, "logprobs": {"top_logprobs": [{"a": 3.0, "b": 1.0}]}}
+                ]
+            }
+            row = http._reconstruct_logits(body, 1)
+
+        logprobs = torch.nn.functional.log_softmax(row, dim=-1)
+        kl = torch.nn.functional.kl_div(
+            logprobs, logprobs.clone(), reduction="batchmean", log_target=True
+        )
+        self.assertTrue(torch.isfinite(kl).all())
+        self.assertEqual(float(kl), 0.0)
+
+    def test_unknown_token_text_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            http = self._transport(temporary)
+            body = {
+                "choices": [{"index": 0, "logprobs": {"top_logprobs": [{"zzz": 1.0}]}}]
+            }
+            with self.assertRaises(ExactLogitsUnavailable) as caught:
+                http._reconstruct_logits(body, 1)
+            self.assertIn("not in the checkpoint vocabulary", str(caught.exception))
+
+    def test_missing_logprobs_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            http = self._transport(temporary)
+            with self.assertRaises(ExactLogitsUnavailable):
+                http._reconstruct_logits({"choices": [{"index": 0}]}, 1)
 
 
 class TestAdapterLifecycle(unittest.TestCase):

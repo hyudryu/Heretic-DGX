@@ -82,6 +82,16 @@ BACKEND_NAME = "vllm_deepseek_v41"
 #: deployment's ``tokenizer_mode="deepseek_v41"`` encoder.
 ChatMessages = list[dict[str, str]]
 
+#: Placeholder logit for tokens the engine omits (its logit is ``-inf``).
+#:
+#: Deliberately a finite number. ``-inf`` here would make ``F.kl_div`` with
+#: ``log_target=True`` evaluate ``0 * (-inf - -inf) = NaN``, silently turning
+#: every KL score into NaN. This value sits far below the observed minimum in
+#: float32, so its softmax probability underflows to exactly 0 and it
+#: contributes exactly nothing to the divergence -- in both the baseline and
+#: every trial, identically.
+IMPOSSIBLE_LOGIT = -1.0e4
+
 #: Layer whose residual width we validate capture against.
 _PROBE_LAYER = 0
 
@@ -158,6 +168,7 @@ class HttpVllmTransport:
         capture_layer_path: str = "/heretic/hidden_states",
         load_lora_path: str = "/v1/load_lora_adapter",
         unload_lora_path: str = "/v1/unload_lora_adapter",
+        checkpoint_directory: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model_name = model_name
@@ -166,6 +177,11 @@ class HttpVllmTransport:
         self.capture_layer_path = capture_layer_path
         self.load_lora_path = load_lora_path
         self.unload_lora_path = unload_lora_path
+        # Needed to map returned token text back to ids and to size the dense
+        # logit vector. Only the logits path uses it.
+        self.checkpoint_directory = checkpoint_directory
+        self._vocab_size: int | None = None
+        self._vocab: dict[str, int] | None = None
 
     # -- plumbing ---------------------------------------------------------
 
@@ -198,6 +214,68 @@ class HttpVllmTransport:
     @staticmethod
     def _extra_body(lora_name: str | None) -> dict[str, Any]:
         return {"lora_name": lora_name} if lora_name else {}
+
+    @property
+    def vocab_size(self) -> int:
+        """Vocabulary size, read from the checkpoint config and cached."""
+
+        if self._vocab_size is None:
+            size = None
+            if self.checkpoint_directory is not None:
+                config_path = Path(self.checkpoint_directory) / "config.json"
+                if config_path.is_file():
+                    with config_path.open("rb") as stream:
+                        config = json.loads(stream.read())
+                    for candidate in (config.get("text_config"), config):
+                        if isinstance(candidate, dict) and isinstance(
+                            candidate.get("vocab_size"), int
+                        ):
+                            size = int(candidate["vocab_size"])
+                            break
+            if size is None:
+                size = len(self._vocab_map())
+            self._vocab_size = size
+        return self._vocab_size
+
+    def _vocab_map(self) -> dict[str, int]:
+        """Token text -> id, from the checkpoint's ``tokenizer.json``.
+
+        Verified 1:1 for this checkpoint: 128000 BPE entries plus 1283 added
+        tokens, no duplicate strings, so every returned token text resolves to
+        exactly one id.
+        """
+
+        if self._vocab is None:
+            if self.checkpoint_directory is None:
+                raise BackendUnavailable(
+                    "cannot rebuild token ids without a checkpoint directory"
+                )
+            path = Path(self.checkpoint_directory) / "tokenizer.json"
+            if not path.is_file():
+                raise BackendUnavailable(f"cannot rebuild token ids without {path}")
+            with path.open("rb") as stream:
+                tokenizer = json.loads(stream.read())
+
+            mapping: dict[str, int] = {}
+            model = tokenizer.get("model")
+            vocab = model.get("vocab") if isinstance(model, dict) else None
+            if not isinstance(vocab, dict):
+                raise BackendUnavailable("tokenizer.json has no BPE vocabulary")
+            for text, index in vocab.items():
+                if isinstance(text, str) and isinstance(index, int):
+                    mapping.setdefault(text, index)
+            added = tokenizer.get("added_tokens")
+            if isinstance(added, list):
+                for entry in added:
+                    if not isinstance(entry, dict):
+                        continue
+                    content = entry.get("content")
+                    index = entry.get("id")
+                    if isinstance(content, str) and isinstance(index, int):
+                        # Added tokens win: they are what the engine emits.
+                        mapping[content] = index
+            self._vocab = mapping
+        return self._vocab
 
     # -- protocol ---------------------------------------------------------
 
@@ -265,23 +343,36 @@ class HttpVllmTransport:
     ) -> Tensor:
         """Dense ``(batch, vocab)`` raw first-token logits.
 
-        ``logprobs=-1`` with ``logprobs_mode="raw_logits"`` is the only
-        configuration that yields the full, unprocessed vocabulary. Anything less
-        is rejected by :meth:`_reconstruct_logits`.
+        ``logprobs`` must be the *vocabulary size*, not ``-1``. Verified against
+        the live engine: ``logprobs=-1`` is accepted but silently returns an empty
+        distribution (a negative count slices to nothing), while
+        ``logprobs=<vocab_size>`` returns the full raw-logit vector. The engine
+        must also run with ``--max-logprobs -1 --logprobs-mode raw_logits``.
         """
 
-        # One request per conversation, as the chat surface requires.
+        # The chat surface caps logprobs at top_logprobs (<= 20) and is boolean
+        # only, so the full vocabulary has to come from the completions surface:
+        # encode with /tokenize, then score those token ids.
+        vocab_size = self.vocab_size
         blocks: list[Tensor] = []
         for conversation in messages:
+            tokenized = self._post(
+                "/tokenize",
+                {"model": self.model_name, "messages": conversation},
+            )
+            token_ids = tokenized.get("tokens") if isinstance(tokenized, dict) else None
+            if not isinstance(token_ids, list) or not token_ids:
+                raise BackendUnavailable(
+                    "the deployment did not return prompt token ids from /tokenize"
+                )
             body = self._post(
-                "/v1/chat/completions",
+                "/v1/completions",
                 {
                     "model": self.model_name,
-                    "messages": conversation,
+                    "prompt": [token_ids],
                     "max_tokens": 1,
                     "temperature": 0,
-                    "logprobs": -1,
-                    **self._continuation(conversation),
+                    "logprobs": vocab_size,
                     **self._extra_body(lora_name),
                 },
             )
@@ -291,14 +382,20 @@ class HttpVllmTransport:
     def _reconstruct_logits(self, body: dict[str, Any], batch: int) -> Tensor:
         """Rebuild a dense ``(batch, vocab)`` tensor in token-ID order.
 
-        The contract this backend requires is one dense raw-logit vector per
-        prompt, indexed by token id, covering the *entire* vocabulary. A top-K
-        distribution and a processed (post-sampler) distribution are both
-        rejected here rather than silently substituted, because the KL divergence
-        scorer would otherwise report a different quantity under the same name.
+        The engine returns a *sparse-ish* map of token text to raw logit and omits
+        every token whose logit is ``-inf`` (1387 of 129280 for this checkpoint,
+        from never-trained and reserved ids). Two things follow:
 
-        Whether a given vLLM build actually serves this shape has **not** been
-        validated against a live deployment yet; see ``docs/BLOCKERS.md``.
+        - The text keys must be mapped back to ids. That is unambiguous here:
+          the checkpoint's ``tokenizer.json`` has 128000 BPE entries plus 1283
+          added tokens and no duplicate strings, so the mapping is 1:1.
+        - The omitted ids must be filled with a **finite** sentinel, never
+          ``-inf``. ``KLDivergence`` applies ``F.log_softmax`` and then
+          ``F.kl_div(..., log_target=True)``; ``-inf`` on both sides makes that
+          ``0 * (-inf - -inf) = NaN`` and would poison every score. The sentinel
+          is far enough below the observed minimum that its softmax probability
+          underflows to exactly zero, so it contributes exactly nothing -- and it
+          is identical across baseline and trials, so it cannot bias the result.
         """
 
         choices = body.get("choices")
@@ -307,36 +404,45 @@ class HttpVllmTransport:
                 "vLLM did not return one choice per prompt for a logprobs request"
             )
 
-        vocab_size = body.get("vocab_size")
         rows: list[Tensor] = []
         for choice in sorted(choices, key=lambda item: item.get("index", 0)):
             content = choice.get("logprobs")
             if not isinstance(content, dict):
                 raise ExactLogitsUnavailable(
-                    "vLLM returned no logprobs. The deployment must expose "
-                    "logprobs=-1 with logprobs_mode='raw_logits'."
+                    "vLLM returned no logprobs. The engine must run with "
+                    "--max-logprobs -1 --logprobs-mode raw_logits, and the "
+                    "request must ask for logprobs=<vocab_size>."
                 )
-            dense = content.get("raw_logits")
-            if not isinstance(dense, list) or not isinstance(vocab_size, int):
+            entries = content.get("top_logprobs")
+            first = entries[0] if isinstance(entries, list) and entries else None
+            if not isinstance(first, dict) or not first:
                 raise ExactLogitsUnavailable(
-                    "the deployment did not return a dense full-vocabulary raw "
-                    "logit vector. Configure max_logprobs=-1 and "
-                    "logprobs_mode='raw_logits' on the vLLM engine. A top-K "
-                    "distribution is not an acceptable substitute for KL "
-                    "divergence."
+                    "the deployment returned an empty distribution. Note that "
+                    "logprobs=-1 is accepted but empty on this engine; ask for "
+                    "logprobs=<vocab_size> instead. A top-K distribution is not "
+                    "an acceptable substitute for KL divergence."
                 )
-            row = torch.tensor(dense, dtype=torch.float32)
-            if row.numel() != vocab_size:
+
+            vocab_size = self.vocab_size
+            row = torch.full((vocab_size,), IMPOSSIBLE_LOGIT, dtype=torch.float32)
+            text_to_id = self._vocab_map()
+            resolved = 0
+            for text, value in first.items():
+                token_id = text_to_id.get(text)
+                if token_id is None:
+                    raise ExactLogitsUnavailable(
+                        f"token {text!r} is not in the checkpoint vocabulary"
+                    )
+                row[token_id] = float(value)
+                resolved += 1
+            if resolved < 2:
                 raise ExactLogitsUnavailable(
-                    f"raw logits carry {row.numel()} entries but the vocabulary "
-                    f"has {vocab_size} tokens"
+                    f"only {resolved} logits were returned; the full vocabulary "
+                    "is required"
                 )
             rows.append(row)
 
-        logits = torch.stack(rows)
-        if not torch.isfinite(logits).all():
-            raise ExactLogitsUnavailable("raw logits contain non-finite values")
-        return logits
+        return torch.stack(rows)
 
     def hidden_states(
         self,
@@ -424,6 +530,7 @@ class DeepSeekV41Runtime(ModelRuntime):
                 settings.vllm_model_name or settings.model,
                 api_key=settings.vllm_api_key,
                 timeout=float(settings.vllm_timeout_seconds),
+                checkpoint_directory=str(checkpoint),
             )
 
     # -- capabilities -----------------------------------------------------
