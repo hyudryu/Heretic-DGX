@@ -3,6 +3,16 @@
 A staged rollout for DeepSeek V4.1 Flash on four DGX Sparks. Start with a
 5-trial smoke test, confirm the whole loop works, then scale up only if it does.
 
+> **BLOCKED — do not start stage 1.** Stage 0 has been run against the real
+> checkpoint and it **fails**. `transformers` implements no `deepseek_v41`
+> architecture at any version (pinned commit, latest release 5.17.0, and `main`
+> all lack it), and Heretic loads models only through `transformers`. Details and
+> evidence: [`BLOCKERS.md`](BLOCKERS.md).
+>
+> Everything below remains the correct plan for *once that is resolved*. It is
+> not runnable today, and stage 0 is no longer a question this document needs to
+> ask.
+
 Before you read the stages, read [§2](#2-the-two-things-that-make-this-different-from-a-normal-run).
 Two behaviours of the cluster path dictate the shape of this plan, and the
 obvious approach does not work.
@@ -163,17 +173,27 @@ the study, restores the stored settings, and runs the remaining trials up to
 Do not skip this. Confirm the model loads and the Engram offload engages before
 spending hours on optimization.
 
-Watch for, on **every** rank:
+**Result: FAILED.** Recorded on `gx10-node-1` against the materialised
+checkpoint at `/models/DeepSeek-V4.1-Flash`:
 
 ```
-Engram table DISK-backed: 96001542 rows x 256 per rank stay on disk (47.9 GiB not allocated)
+* Trying dtype bfloat16...
+* Failed: The checkpoint you are trying to load has model type `deepseek_v41`
+  but Transformers does not recognize this architecture.
+* Trying dtype float32...
+* Failed: (same)
+Exception: Failed to load model with all configured dtypes.
 ```
 
-If you do not see that line on all four ranks, the tables are resident and you
-will exhaust memory. See `docs/TP4.md` §7.
+It fails inside `Model(settings)`, before any GPU work, for every configured
+dtype. The cause is external to this repository: see [`BLOCKERS.md`](BLOCKERS.md).
 
-Success: model loads on all four, the line appears four times, memory stays in
-budget.
+An earlier version of this section told you to watch for a
+`Engram table DISK-backed: ...` line on every rank. **That line cannot appear** —
+it is produced by `EngramOffloadPlan.describe()`, which nothing calls, because
+the Engram offload is not wired into the load path at all. `docs/TP4.md` §7 has
+been corrected, and blocker 3 in `BLOCKERS.md` explains what is missing.
+
 
 ### Stage 1 — 5 trials
 
@@ -296,14 +316,17 @@ If a full 200-trial run is too expensive, the honest levers in order:
 
 ## 8. What this plan cannot tell you yet
 
-Everything above assumes the loop works. Two things are unverified:
+Everything above assumes the loop works. One of the two open questions has since
+been answered, and the answer is no:
 
-- **Whether Heretic can load DeepSeek V4.1 Flash at all.** It loads through
-  `AutoModelForCausalLM.from_pretrained(..., tp_plan="auto")`; the checkpoint is
-  `transformers 5.6.0` with a custom architecture and custom kernels. Stage 0
-  exists to answer this cheaply.
+- ~~**Whether Heretic can load DeepSeek V4.1 Flash at all.**~~ **Answered: it
+  cannot.** `transformers` has no `deepseek_v41` implementation at the pinned
+  commit, at the latest release (5.17.0), or on `main`, and Heretic loads models
+  only through `transformers`. See [`BLOCKERS.md`](BLOCKERS.md). The blocked
+  command and its exact error are recorded in stage 0 above.
 - **The real per-trial time.** The timeout values in the stage table are
   estimates. Replace them with measured values after stage 1.
 
 Neither the N-node generalization nor the Engram disk path has been exercised on
 physical four-node hardware. See `docs/TP4.md` §10.
+

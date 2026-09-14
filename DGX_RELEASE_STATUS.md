@@ -23,11 +23,25 @@ NVIDIA DGX Spark systems running one NCCL rank per node.
   untouched model's first-token distributions on five
   `mlabonne/harmless_alpaca` prompts.
 
-## TP4 and DeepSeek V4.1 Flash — implemented, not yet hardware-validated
+## TP4 and DeepSeek V4.1 Flash — blocked upstream
 
-The four-node (TP4) topology and the disk-backed Engram path are implemented
-and covered by unit tests, but they have **not** been run end to end on
-physical four-node hardware.
+The four-node (TP4) topology is implemented and covered by unit tests, but the
+target model **cannot currently be loaded at all**. `transformers` implements no
+`deepseek_v41` architecture — not at the pinned commit, not in the latest
+release (5.17.0), and not on `main` — and Heretic loads models only through
+`transformers`.
+
+A load attempt on `gx10-node-1` against the materialised checkpoint reached
+`Model(settings)` and failed there, for every configured dtype:
+
+```
+* Failed: The checkpoint you are trying to load has model type `deepseek_v41`
+  but Transformers does not recognize this architecture.
+Exception: Failed to load model with all configured dtypes.
+```
+
+Full evidence and analysis, including four further blockers:
+[`docs/BLOCKERS.md`](docs/BLOCKERS.md).
 
 ### What is implemented
 
@@ -41,6 +55,11 @@ physical four-node hardware.
 - `model_loading` detects DeepSeek V4.1 Flash and computes the per-rank Engram
   row ranges from the checkpoint's `engram_layer_ids` /
   `engram_num_embeddings` / `engram_head_dim`.
+
+**Caveat: neither of the last two is connected to anything.** Both modules are
+referenced only by `tests/`; `model.py` never calls them, so `engram_disk = true`
+has no effect and the tables are loaded as ordinary parameters. That is blocker 3
+in [`docs/BLOCKERS.md`](docs/BLOCKERS.md).
 
 ### What is tested
 
@@ -59,15 +78,19 @@ physical four-node hardware.
 Following release 0.1's own discipline, each new topology and model needs its
 own proof. For TP4 + DeepSeek V4.1 Flash:
 
-1. Load on all four ranks with `engram_disk = true`; confirm the
-   "Engram table DISK-backed" log line on every rank and that memory stays
-   within the 128 GB-per-node budget.
+1. Load on all four ranks with `engram_disk = true`. — **Attempted; fails for
+   reasons external to this repository** (see above). The "Engram table
+   DISK-backed" log line previously named here cannot appear at all: it is
+   produced by `EngramOffloadPlan.describe()`, which nothing calls, because the
+   offload is not wired into the load path.
 2. Run a short optimization pass on a small prompt set.
-3. Export a standalone checkpoint, reload it, and generate.
+3. Export a standalone checkpoint, reload it, and generate. — also blocked: the
+   exporter is hard-coded to Laguna S 2.1 FP8 (`expected_layer_count=48`; this
+   model has 40 layers).
 4. Measure KL divergence against the untouched model as a sanity check.
 
-Until then, treat TP4 as implemented and unit-tested, not validated. The
-runbook for that validation is in [`docs/TP4.md`](docs/TP4.md).
+Until then, treat TP4 as implemented and unit-tested, not validated. The runbook
+for that validation is in [`docs/TP4.md`](docs/TP4.md).
 
 ## Supported boundary
 

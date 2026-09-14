@@ -9,8 +9,23 @@ It supports two configurations:
 
 - **Two nodes** — the original release-0.1 topology, validated end to end.
 - **Four nodes (TP4)** — for models that need more memory, specifically
-  DeepSeek V4.1 Flash, whose Engram n-gram tables stay on the SSD.
+  DeepSeek V4.1 Flash, whose Engram n-gram tables are meant to stay on the SSD.
   See [`docs/TP4.md`](docs/TP4.md).
+
+> ### Not usable with DeepSeek V4.1 Flash yet
+>
+> **TP4 + DeepSeek V4.1 Flash does not currently run.** `transformers`
+> implements no `deepseek_v41` architecture at any version — not at the pinned
+> commit, not in the latest release (5.17.0), and not on `main` — and Heretic
+> loads models only through `transformers`. A load attempt against the real
+> checkpoint fails inside `Model(settings)`, before any GPU work.
+>
+> Two further gaps sit behind that one: the Engram disk offload described below
+> is implemented and unit-tested but **not wired into the model load path**, so
+> `engram_disk = true` currently has no effect; and the standalone exporter is
+> still hard-coded to Laguna S 2.1 FP8 (48 layers — this model has 40).
+>
+> Full evidence and analysis: [`docs/BLOCKERS.md`](docs/BLOCKERS.md).
 
 ## Relationship to the original Heretic project
 
@@ -46,9 +61,14 @@ Measured from the released checkpoint they are **189.1 GiB** of fp8 data —
 DGX Spark has 128 GB of unified memory shared with the host, so holding both
 would leave no headroom for activations or residual tensors.
 
-With `engram_disk = true` the tables stay on the SSD and are read on demand, so
-only the transformer weights occupy memory. The tables are opened read-only
-(`O_RDONLY` + `POSIX_FADV_RANDOM`) and are never modified.
+`engram_disk = true` is **intended** to keep the tables on the SSD and read them
+on demand, so that only the transformer weights occupy memory. The reader opens
+them read-only (`O_RDONLY` + `POSIX_FADV_RANDOM`) and never modifies them.
+
+Be aware that this is not yet true in practice: `heretic.engram_disk` is
+unit-tested, but nothing in the model load path calls it, so the tables are
+currently loaded as ordinary parameters. See
+[`docs/BLOCKERS.md`](docs/BLOCKERS.md) §3.
 
 This is practical because each rank reads only its own row range (~47 GiB at
 TP4, not 189 GiB), the whole forward's hash ids are gathered in one batch, and
@@ -78,9 +98,11 @@ See [`docs/TP4.md`](docs/TP4.md) for the full runbook.
   verifies intended tensor changes before reporting success.
 
 This release is narrow by design: **Linux, NCCL, and one rank per node.** The
-two-node topology is validated end to end; the TP4 topology and the disk-backed
-Engram path are implemented and unit-tested but have not yet been run on
-physical four-node hardware. See
+two-node topology is validated end to end. The TP4 topology and the Engram disk
+path are implemented and unit-tested, but have not been run on physical
+four-node hardware — and cannot be, because DeepSeek V4.1 Flash cannot currently
+be loaded by `transformers` at all. See
+[`docs/BLOCKERS.md`](docs/BLOCKERS.md) and
 [`docs/TP4.md`](docs/TP4.md#10-validation-status-and-limits).
 
 ## Validated model

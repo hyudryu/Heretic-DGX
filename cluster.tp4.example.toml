@@ -83,6 +83,13 @@ engram_disk_chunk = 16
 # well); `rank_address` is the address NCCL uses for rank traffic, and rank 0's
 # rank_address becomes MASTER_ADDR.
 #
+# CHOOSE RANK 0 FOR WHERE THE EXPORT SHOULD LAND. Only rank 0 writes an export:
+# LocalModelRuntime.save_adapter/save_merged send every non-zero rank to a
+# tempfile.mkdtemp() sink that is deleted afterwards, and only rank 0 reaches the
+# export menu. Rank 0 is launched locally, so "save the model on node X" means
+# "make node X rank 0, and run the launcher from node X". If there is no shared
+# filesystem, that is the only way to direct the output.
+#
 # The addresses below are Tailscale (100.64.0.0/10) mesh addresses. If your
 # nodes also have a direct high-speed fabric, prefer those addresses for
 # rank_address and keep Tailscale for the SSH `host` path -- collective

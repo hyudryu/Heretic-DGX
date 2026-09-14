@@ -258,6 +258,26 @@ find /models/DeepSeek-V4.1-Flash -maxdepth 1 -type l | wc -l   # expect 0
 ls /models/DeepSeek-V4.1-Flash/config.json                     # regular file
 ```
 
+**Status on this cluster: done.** The farm exists at
+`/models/DeepSeek-V4.1-Flash` on all four nodes, built from commit
+`dba1be0a40aa45a94ad051997016db3960a90277` of
+`models--deepseek-ai--DeepSeek-V4.1-Flash`:
+
+| Check | Node 1 | Node 2 | Node 3 | Node 4 |
+|---|---|---|---|---|
+| hard links created | 55 | 55 | 55 | 55 |
+| directories copied | 4 | 4 | 4 | 4 |
+| symlinks remaining | 0 | 0 | 0 | 0 |
+| `*.safetensors` regular files | 48 | 48 | 48 | 48 |
+| `config.json` | regular, `links 2` | regular, `links 2` | regular, `links 2` | regular, `links 2` |
+
+`links 2` is the confirmation that the hard link worked: the same inode is now
+reachable from both `blobs/` and `/models/`. Free space was unchanged on every
+node, because a hard link adds a directory entry and nothing else.
+
+The script that did it (idempotent, safe to re-run) is in the operations
+workspace as `_tools/farm.sh`.
+
 ### Other notes
 
 - This is the **Hugging Face** checkpoint, not a `convert.py`-style
@@ -322,25 +342,130 @@ For a staged rollout that starts at 5 trials and scales to 200, see
 values and two non-obvious constraints of the cluster path (settings are locked
 into the study on the first run, and there is no TTY to answer prompts).
 
+### Where the exported model lands, and why rank 0 is node 4
+
+**Only rank 0 writes an export.** `LocalModelRuntime.save_adapter` and
+`save_merged` read:
+
+```python
+sink = directory if rank == 0 else tempfile.mkdtemp(prefix=f"heretic-...-rank-{rank}-")
+...
+is_main_process=rank == 0
+```
+
+so every non-zero rank writes into a throwaway temp directory that is deleted
+afterwards. And only rank 0 reaches the export menu at all — worker ranks enter
+`run_dgx_worker` and loop on `receive()` instead. The exported model therefore
+lands on **whatever filesystem rank 0 is running on**.
+
+Since rank 0 is launched **locally**, "save the model on node 4" means "make
+node 4 rank 0, and launch from node 4". There is no shared filesystem on this
+cluster (NFS is inactive, and there are no `nfs`/`sshfs`/`cifs` mounts), so a
+mount-based redirect is not available.
+
+Free space is what makes this necessary rather than merely tidy:
+
+| Node | Root filesystem | Free |
+|---|---|---|
+| `spark-node-4` | 3.7T | **1.5T** |
+| `gx10-node-3` | 916G | 125G |
+| `gx10-node-2` | 916G | 71G |
+| `gx10-node-1` | 916G | **19G** |
+
+Node 1, the original coordinator, cannot hold an export.
+
+The cluster file therefore lists node 4 first:
+
+```toml
+[[nodes]]
+host = "10.100.58.4"          # spark-node-4, rank 0, launched locally
+rank_address = "10.100.58.4"
+
+[[nodes]]
+host = "10.100.58.1"          # gx10-node-1
+rank_address = "10.100.58.1"
+
+[[nodes]]
+host = "10.100.58.3"          # gx10-node-2
+rank_address = "10.100.58.3"
+
+[[nodes]]
+host = "10.100.58.2"          # gx10-node-3
+rank_address = "10.100.58.2"
+```
+
+and the run is launched **from node 4**:
+
+```sh
+ssh hyudryu@10.100.58.4
+cd /opt/heretic-dgx
+uv run heretic \
+  --cluster /opt/heretic-cluster-tp4.toml \
+  --config ./config.default.toml \
+  --model /models/DeepSeek-V4.1-Flash \
+  --model-action save \
+  --export-strategy standalone \
+  --trial-index 0 \
+  --save-directory /models/abliterated/deepseek-v4.1-flash-heretic
+```
+
+Three things to watch:
+
+- **Do not run this from node 1.** The launcher starts rank 0 *locally*, so a
+  config that lists node 4 first but is invoked on node 1 would give node 1 rank
+  0's identity while node 4 is also launched as rank 0 — a silent rank
+  misassignment. Node 1's copy of the config has been parked as
+  `/opt/heretic-cluster-tp4.toml.stale-node1-coordinator` to prevent this.
+- **`--save-directory` must be passed every time.** It is `exclude=True` in
+  `Settings`, so it is never persisted into the study config.
+- **Rank order is not free.** Row sharding for the Engram tables is
+  `EngramTableLayout.for_rank(rank=..., world_size=...)`, so moving a node
+  changes which rows it owns. That is fine and symmetric, but a study resumed
+  across a rank-order change is not comparable to an earlier stage.
+
+
 ---
 
 ## 7. Verifying the Engram offload is actually active
 
-The rank logs report it at startup. On each rank you should see a line like:
+> **This does not work yet.** The mechanism described in this section is
+> implemented and unit-tested but is not wired into the model load path, so
+> `engram_disk = true` currently has no effect. See
+> [`BLOCKERS.md`](BLOCKERS.md) — the load cannot even be attempted until
+> transformers supports the architecture.
+
+The intended signal is a line in each rank's log at startup:
 
 ```
-Engram table DISK-backed: 96001542 rows x 256 per rank stay on disk (47.9 GiB not allocated)
+2 engram layers, 96001542 rows per rank kept on disk (47.3 GiB not allocated)
 ```
 
-If you see that line, the tables are **not** resident and are being read from
-`engram_disk_path`. If instead the process allocates hundreds of GiB or dies
-with unified-memory exhaustion, disk mode is not active -- check that
-`engram_disk = true` and `engram_disk_path` are set, and that the path exists
-on that node.
+That text comes from `EngramOffloadPlan.describe()`. **Nothing calls it**, so the
+line is never printed today. If you are looking for evidence that the offload is
+active, this is not it — there is currently no such evidence to find.
 
-A quick standalone check that the reader works against your checkpoint, without
-launching the cluster: see `tests/test_engram_disk.py`, which builds synthetic
-shards in the real layout and verifies the row offsets per rank.
+The status today:
+
+- `heretic.engram_disk` (`DiskEngramTable`, `EngramDiskConfig`,
+  `from_rank_environment`, `gather_dequant_many`) is referenced only by
+  `tests/test_engram_disk.py`.
+- `heretic.model_loading.build_engram_offload_plan`, `is_deepseek_v41_config`,
+  and `is_engram_tensor` are referenced only by
+  `tests/test_model_loading_deepseek.py`.
+- `heretic.model.Model.__init__` goes straight to
+  `from_pretrained(..., tp_plan="auto")` with no Engram handling, no excluded
+  tensors, and no forward hook.
+
+So if you run it as-is, the Engram tables are ordinary parameters and the
+process will try to allocate them like any other weight.
+
+What *is* real and verifiable without launching a cluster: `EngramTableLayout`
+computes per-rank row ranges from the real checkpoint geometry, pinned by
+`tests/test_engram_disk.py` (including a negative control proving the
+row-offset test can actually detect the upstream bug), and
+`tests/test_model_loading_deepseek.py` checks the plan against the released
+config's `engram_*` fields.
+
 
 ---
 
@@ -403,18 +528,38 @@ control that proves the test can actually detect the bug.
 
 ## 10. Validation status and limits
 
-Be clear-eyed about this: the N-node generalization and the Engram reader are
-covered by the unit tests in `tests/` (76 tests, green on Linux), but **they
-have not yet been run end to end on the four physical Sparks.** The plan is to
-validate TP4 in this order:
+**Blocker: the model cannot be loaded at all yet.** `transformers` does not
+implement the `deepseek_v41` architecture — not at the pinned commit, not in the
+latest PyPI release (5.17.0), and not on `main`. Heretic loads models only
+through `transformers`, so there is no load path.
+
+This was verified by running the real entry point on `gx10-node-1` against the
+materialised checkpoint:
+
+```
+* Trying dtype bfloat16...
+* Failed: The checkpoint you are trying to load has model type `deepseek_v41`
+  but Transformers does not recognize this architecture.
+...
+Exception: Failed to load model with all configured dtypes.
+```
+
+It fails inside `Model(settings)`, before any GPU work. The full analysis, with
+evidence and the four further blockers behind it, is in
+[`BLOCKERS.md`](BLOCKERS.md). Read that first.
+
+The planned validation order is unchanged, and step 1 has now been *attempted*
+and failed for reasons outside this repository:
 
 1. Load the model on all four ranks with the Engram offload on, and confirm the
-   "DISK-backed" lines and that memory stays within budget.
+   "DISK-backed" lines and that memory stays within budget. — **FAILS: no
+   transformers implementation of the architecture.**
 2. Run a short optimization pass on a small prompt set.
-3. Export standalone, reload, and generate.
+3. Export standalone, reload, and generate. — **also blocked: the standalone
+   exporter is hard-coded to Laguna S 2.1 FP8 (48 layers); this model has 40.**
 4. Measure KL divergence as a sanity check.
 
 Per the original project's own release discipline, a new topology or model is
 not "supported" until it has been through load, optimize, export, reload, and
-generation. Treat this document as the plan for that validation, not as a claim
-that it is already done.
+generation. **DeepSeek V4.1 Flash on TP4 is not supported.**
+
