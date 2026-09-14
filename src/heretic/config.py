@@ -46,6 +46,19 @@ class ExportStrategy(str, Enum):
     STANDALONE = "standalone"
 
 
+class BackendMethod(str, Enum):
+    """How model execution is provided.
+
+    ``AUTO`` inspects the raw model config and picks the native vLLM backend for
+    DeepSeek V4.1 Flash -- which ``transformers`` cannot load at all -- and the
+    in-process transformers backend for everything else.
+    """
+
+    AUTO = "auto"
+    TRANSFORMERS = "transformers"
+    VLLM_DEEPSEEK_V41 = "vllm_deepseek_v41"
+
+
 class DatasetSpecification(BaseModel):
     dataset: str = Field(
         description="Hugging Face dataset ID, or path to dataset on disk."
@@ -174,6 +187,72 @@ class Settings(BaseSettings):
     model_commit: str | None = Field(
         default=None,
         description="Hugging Face commit hash of the model.",
+    )
+
+    model_backend: BackendMethod = Field(
+        default=BackendMethod.AUTO,
+        description=(
+            'Which execution backend to use: "auto", "transformers", or '
+            '"vllm_deepseek_v41". "auto" reads the raw model config and selects '
+            "the native vLLM backend for DeepSeek V4.1 Flash, which transformers "
+            "cannot load, and the in-process transformers backend otherwise."
+        ),
+    )
+
+    vllm_base_url: str | None = Field(
+        default=None,
+        description=(
+            "Base URL of a running vLLM deployment serving DeepSeek V4.1 Flash, "
+            'e.g. "http://127.0.0.1:8000". Required by the vllm_deepseek_v41 '
+            "backend."
+        ),
+        exclude=True,
+    )
+
+    vllm_model_name: str | None = Field(
+        default=None,
+        description=(
+            "Served model name to address in vLLM requests. Defaults to the "
+            "model setting."
+        ),
+        exclude=True,
+    )
+
+    vllm_api_key: str | None = Field(
+        default=None,
+        description="Bearer token for the vLLM deployment, if it requires one.",
+        exclude=True,
+    )
+
+    vllm_timeout_seconds: PositiveInt = Field(
+        default=600,
+        description="Per-request timeout for vLLM calls, in seconds.",
+        exclude=True,
+    )
+
+    vllm_checkpoint_directory: str | None = Field(
+        default=None,
+        description=(
+            "Directory holding the DeepSeek V4.1 Flash safetensors checkpoint, "
+            "used to locate the abliteration target matrices. Defaults to the "
+            "model setting when that is a local path."
+        ),
+        exclude=True,
+    )
+
+    vllm_lora_name: str = Field(
+        default="heretic-trial",
+        description="Adapter name Heretic loads and unloads in vLLM per trial.",
+        exclude=True,
+    )
+
+    vllm_lora_directory: str = Field(
+        default=".heretic-v41-adapters",
+        description=(
+            "Local directory where per-trial LoRA adapters are written before "
+            "being handed to vLLM."
+        ),
+        exclude=True,
     )
 
     evaluate_model: str | None = Field(

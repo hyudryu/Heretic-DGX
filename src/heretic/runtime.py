@@ -6,6 +6,7 @@ import shutil
 import tempfile
 from abc import ABC, abstractmethod
 from contextlib import suppress
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,10 +28,34 @@ def gather_tensor_parallel_lora_shard(local: Tensor, *, dimension: int) -> Tenso
     return torch.cat(shards, dim=dimension)
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeCapabilities:
+    """What a backend can do, without exposing how it does it.
+
+    Generic Heretic code reads this instead of reaching into a concrete model,
+    so the optimization loop is identical whether inference runs in-process
+    through Transformers or through a remote vLLM deployment. In particular,
+    never call ``model.get_layers()`` just to learn a layer count -- that is
+    exactly the coupling this type exists to remove.
+    """
+
+    backend_name: str
+    layer_count: int
+    abliterable_components: tuple[str, ...]
+    distributed: bool
+    supports_exact_logits: bool
+    supports_adapter_export: bool
+    supports_merged_export: bool
+
+
 class ModelRuntime(ABC):
     """Model operations that must execute in lockstep across active ranks."""
 
     distributed = False
+
+    @property
+    @abstractmethod
+    def capabilities(self) -> RuntimeCapabilities: ...
 
     @abstractmethod
     def shutdown(self) -> None: ...
@@ -84,6 +109,31 @@ class LocalModelRuntime(ModelRuntime):
     def __init__(self, model: Model) -> None:
         self._model = model
         self._is_shutdown = False
+
+    @property
+    def capabilities(self) -> RuntimeCapabilities:
+        return RuntimeCapabilities(
+            backend_name="transformers",
+            layer_count=len(self._model.get_layers()),
+            abliterable_components=tuple(self._model.get_abliterable_components()),
+            distributed=self._model.distributed,
+            # The Transformers path returns dense raw first-token logits and can
+            # export adapters and merged checkpoints, exactly as before.
+            supports_exact_logits=True,
+            supports_adapter_export=True,
+            supports_merged_export=True,
+        )
+
+    @property
+    def model(self) -> Model:
+        """The underlying Transformers model.
+
+        Only for code that is explicitly Transformers-specific -- tokenizer and
+        processor serialization, hub upload, benchmarks. Generic optimization
+        code must go through this runtime instead.
+        """
+
+        return self._model
 
     def _require_active(self) -> None:
         if self._is_shutdown:

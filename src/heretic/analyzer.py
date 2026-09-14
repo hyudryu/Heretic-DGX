@@ -13,7 +13,6 @@ from rich.table import Table
 from torch import Tensor
 
 from .config import Settings
-from .model import Model
 from .utils import print
 
 
@@ -21,12 +20,14 @@ class Analyzer:
     def __init__(
         self,
         settings: Settings,
-        model: Model,
+        layer_count: int,
         good_residuals: Tensor,
         bad_residuals: Tensor,
     ):
+        if layer_count < 1:
+            raise ValueError(f"layer_count must be positive, got {layer_count}")
         self.settings = settings
-        self.model = model
+        self.layer_count = layer_count
         self.good_residuals = good_residuals
         self.bad_residuals = bad_residuals
 
@@ -72,7 +73,7 @@ class Analyzer:
                 compute_geometric_median(
                     self.good_residuals[:, layer_index, :].detach().cpu()
                 ).median
-                for layer_index in range(len(self.model.get_layers()) + 1)
+                for layer_index in range(self.layer_count + 1)
             ]
         )
         b = self.bad_residuals.mean(dim=0)
@@ -81,7 +82,7 @@ class Analyzer:
                 compute_geometric_median(
                     self.bad_residuals[:, layer_index, :].detach().cpu()
                 ).median
-                for layer_index in range(len(self.model.get_layers()) + 1)
+                for layer_index in range(self.layer_count + 1)
             ]
         )
         r = b - g
@@ -116,10 +117,10 @@ class Analyzer:
         labels = [0] * len(self.good_residuals) + [1] * len(self.bad_residuals)
         silhouettes = [
             silhouette_score(residuals[:, layer_index, :], labels)
-            for layer_index in range(len(self.model.get_layers()) + 1)
+            for layer_index in range(self.layer_count + 1)
         ]
 
-        for layer_index in range(1, len(self.model.get_layers()) + 1):
+        for layer_index in range(1, self.layer_count + 1):
             table.add_row(
                 f"{layer_index}",
                 f"{g_b_similarities[layer_index].item():.4f}",
@@ -184,7 +185,7 @@ class Analyzer:
         pacmap_init = None
 
         for layer_index in track(
-            range(1, len(self.model.get_layers()) + 1),
+            range(1, self.layer_count + 1),
             description="* Computing PaCMAP projections...",
         ):
             good_residuals = (

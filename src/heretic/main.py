@@ -91,6 +91,7 @@ from rich.table import Table
 from rich.traceback import install
 
 from .analyzer import Analyzer
+from .backend import create_runtime
 from .config import ExportStrategy, QuantizationMethod
 from .evaluator import Evaluator
 from .model import AbliterationParameters, Model, get_model_class
@@ -263,7 +264,7 @@ def obtain_export_strategy(
         questionary.select(
             "How do you want to export the model?",
             choices=export_strategy_choices(
-                distributed=model.distributed,
+                distributed=bool(getattr(model, "distributed", False)),
                 quantization=settings.quantization,
             ),
             style=Style([("highlighted", "reverse")]),
@@ -382,7 +383,11 @@ def run(
             raise RuntimeError("DGX coordinator did not provide a finalized seed")
         preflight_distributed_export(settings, distributed=True)
         transformers.set_seed(settings.seed)
-        worker_runner(Model(settings))
+        # Backend selection happens before any Transformers model is built, on
+        # the worker path too -- there is no route into this function that
+        # constructs Model(settings) first.
+        worker_handle = create_runtime(settings)
+        worker_runner(worker_handle.require_model("the DGX worker path"))
         return
 
     print(get_accelerator_info())
@@ -536,8 +541,13 @@ def run(
         settings,
         distributed=settings_synchronizer is not None,
     )
-    model = Model(settings)
-    runtime = runtime_factory(model)
+    # Backend selection happens BEFORE any Transformers model exists, so
+    # DeepSeek V4.1 Flash can be routed to its native vLLM backend without
+    # Transformers ever attempting to build an architecture it does not have.
+    handle = create_runtime(settings, runtime_factory=runtime_factory)
+    runtime = handle.runtime
+    capabilities = handle.capabilities
+    model = handle.model
     print()
     print_memory_usage()
 
@@ -552,6 +562,12 @@ def run(
     print(f"* [bold]{len(bad_prompts)}[/] prompts loaded")
 
     if settings.batch_size == 0:
+        if model is None:
+            raise RuntimeError(
+                "automatic batch-size detection measures throughput with the "
+                f"tokenizer, which the {capabilities.backend_name!r} backend does "
+                "not provide. Set batch_size explicitly."
+            )
         print()
         print("Determining optimal batch size...")
 
@@ -678,7 +694,9 @@ def run(
         good_means = good_residuals.mean(dim=0)
         bad_means = bad_residuals.mean(dim=0)
 
-        analyzer = Analyzer(settings, model, good_residuals, bad_residuals)
+        analyzer = Analyzer(
+            settings, capabilities.layer_count, good_residuals, bad_residuals
+        )
 
         if settings.print_residual_geometry:
             analyzer.print_residual_geometry()
@@ -731,7 +749,7 @@ def run(
             ],
         )
 
-        last_layer_index = len(model.get_layers()) - 1
+        last_layer_index = capabilities.layer_count - 1
 
         # Discrimination between "harmful" and "harmless" inputs is usually strongest
         # in layers slightly past the midpoint of the layer stack. See the original
@@ -751,7 +769,7 @@ def run(
 
         parameters = {}
 
-        for component in model.get_abliterable_components():
+        for component in capabilities.abliterable_components:
             # The parameter ranges are based on experiments with various models
             # and much wider ranges. They are not set in stone and might have to be
             # adjusted for future models.
@@ -1134,7 +1152,7 @@ def run(
                                 continue
                             strategy = require_distributed_standalone_export(
                                 strategy,
-                                distributed=model.distributed,
+                                distributed=bool(getattr(model, "distributed", False)),
                             )
 
                             if strategy == ExportStrategy.STANDALONE:

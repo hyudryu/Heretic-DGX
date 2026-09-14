@@ -16,13 +16,31 @@ from heretic.dgx_runtime import (
     TorchDistributedCommandChannel,
     run_dgx_worker,
 )
-from heretic.runtime import ModelRuntime, gather_tensor_parallel_lora_shard
+from heretic.runtime import (
+    ModelRuntime,
+    RuntimeCapabilities,
+    gather_tensor_parallel_lora_shard,
+)
 from heretic.utils import Prompt
+
+_TEST_CAPABILITIES = RuntimeCapabilities(
+    backend_name="test",
+    layer_count=1,
+    abliterable_components=("attn.o_proj",),
+    distributed=False,
+    supports_exact_logits=True,
+    supports_adapter_export=True,
+    supports_merged_export=True,
+)
 
 
 @dataclass
 class _RecordingRuntime(ModelRuntime):
     calls: list[str] = field(default_factory=list)
+
+    @property
+    def capabilities(self) -> RuntimeCapabilities:
+        return _TEST_CAPABILITIES
 
     def shutdown(self) -> None:
         self.calls.append("shutdown")

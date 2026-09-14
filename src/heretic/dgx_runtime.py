@@ -9,7 +9,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 from .model import AbliterationParameters
-from .runtime import ModelRuntime
+from .runtime import ModelRuntime, RuntimeCapabilities
 from .utils import Prompt
 
 DgxOperation = Literal[
@@ -109,6 +109,17 @@ class DgxCoordinatorRuntime(ModelRuntime):
         self._active = True
         self._failed = False
         self._local_stopped = False
+
+    @property
+    def capabilities(self) -> RuntimeCapabilities:
+        """The wrapped runtime's capabilities, unchanged by coordination.
+
+        Distribution does not add or remove inference abilities, so the
+        coordinator reports exactly what the rank-local runtime does. Generic
+        code therefore reads the same values on every rank.
+        """
+
+        return self._local.capabilities
 
     def _invoke(self, operation: DgxOperation, *args: Any, **kwargs: Any) -> Any:
         if self._failed:

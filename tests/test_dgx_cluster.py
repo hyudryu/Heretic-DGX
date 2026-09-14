@@ -42,6 +42,7 @@ from heretic.rank_preflight import (
     require_matching_rank_preflights,
 )
 from heretic.source_identity import build_source_identity
+from heretic.runtime import RuntimeCapabilities
 
 
 def _source(root: Path):
@@ -798,6 +799,18 @@ rank_address = "10.10.10.2"
         class RuntimeFixture:
             def __init__(self) -> None:
                 self.calls = []
+
+            @property
+            def capabilities(self):
+                return RuntimeCapabilities(
+                    backend_name="test",
+                    layer_count=1,
+                    abliterable_components=("attn.o_proj",),
+                    distributed=False,
+                    supports_exact_logits=True,
+                    supports_adapter_export=True,
+                    supports_merged_export=True,
+                )
 
             def get_responses(self, prompts, *, skip_special_tokens=True):
                 self.calls.append(("get_responses", prompts, skip_special_tokens))
