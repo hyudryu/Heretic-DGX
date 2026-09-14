@@ -182,6 +182,9 @@ class HttpVllmTransport:
         self.checkpoint_directory = checkpoint_directory
         self._vocab_size: int | None = None
         self._vocab: dict[str, int] | None = None
+        #: Cumulative count of returned logits whose rendered text did not map
+        #: to a token id. Reported rather than hidden.
+        self.unmapped_logits = 0
 
     # -- plumbing ---------------------------------------------------------
 
@@ -430,16 +433,29 @@ class HttpVllmTransport:
             for text, value in first.items():
                 token_id = text_to_id.get(text)
                 if token_id is None:
-                    raise ExactLogitsUnavailable(
-                        f"token {text!r} is not in the checkpoint vocabulary"
-                    )
+                    # The engine keys its logprobs by *rendered* token text, and
+                    # a handful of ids render to a string the vocabulary does not
+                    # contain -- the empty string, and reserved/never-trained
+                    # ids. Those are counted and bounded below rather than
+                    # silently dropped in unlimited number.
+                    continue
                 row[token_id] = float(value)
                 resolved += 1
+
+            returned = len(first)
+            unmapped = returned - resolved
             if resolved < 2:
                 raise ExactLogitsUnavailable(
-                    f"only {resolved} logits were returned; the full vocabulary "
-                    "is required"
+                    f"only {resolved} of {returned} returned logits could be "
+                    "mapped to token ids; the full vocabulary is required"
                 )
+            if unmapped > max(64, int(0.001 * returned)):
+                raise ExactLogitsUnavailable(
+                    f"{unmapped} of {returned} returned logits could not be "
+                    "mapped to token ids, which is too many to reconstruct the "
+                    "distribution faithfully"
+                )
+            self.unmapped_logits += unmapped
             rows.append(row)
 
         return torch.stack(rows)

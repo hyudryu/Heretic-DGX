@@ -441,15 +441,34 @@ class TestExactLogits(unittest.TestCase):
         self.assertTrue(torch.isfinite(kl).all())
         self.assertEqual(float(kl), 0.0)
 
-    def test_unknown_token_text_is_rejected(self) -> None:
+    def test_unmappable_token_text_is_bounded_not_fatal(self) -> None:
+        """The engine renders a few ids to strings the vocabulary lacks.
+
+        A handful is tolerated and counted; an unbounded number fails closed.
+        """
+
         with tempfile.TemporaryDirectory() as temporary:
             http = self._transport(temporary)
             body = {
-                "choices": [{"index": 0, "logprobs": {"top_logprobs": [{"zzz": 1.0}]}}]
+                "choices": [
+                    {
+                        "index": 0,
+                        "logprobs": {"top_logprobs": [{"a": 3.0, "b": 1.0, "": 2.0}]},
+                    }
+                ]
             }
-            with self.assertRaises(ExactLogitsUnavailable) as caught:
+            row = http._reconstruct_logits(body, 1)
+        self.assertEqual(float(row[0, 0]), 3.0)
+        self.assertEqual(http.unmapped_logits, 1)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            http = self._transport(temporary)
+            unmappable = {f"nope{i}": float(i) for i in range(200)}
+            body = {
+                "choices": [{"index": 0, "logprobs": {"top_logprobs": [unmappable]}}]
+            }
+            with self.assertRaises(ExactLogitsUnavailable):
                 http._reconstruct_logits(body, 1)
-            self.assertIn("not in the checkpoint vocabulary", str(caught.exception))
 
     def test_missing_logprobs_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
