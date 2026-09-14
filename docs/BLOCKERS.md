@@ -222,6 +222,19 @@ stands, since nothing can be tested end to end.
 - The hard-link checkpoint farm at `/models/DeepSeek-V4.1-Flash` on all four
   nodes: 55 hard links + 4 copied directories, 0 symlinks, 48 shards, zero
   additional bytes.
+- **The farm passes Heretic's real preflight checkpoint gate on all four nodes.**
+  Running the gate itself (`python -m heretic.checkpoint_identity
+  /models/DeepSeek-V4.1-Flash`) exits 0 everywhere — this is the same code path
+  that previously rejected the Hugging Face cache with *"checkpoint metadata must
+  be a regular file: config.json"*. Wall clock: 556 s / 590 s / 544 s / 702 s.
+- **All four nodes agree on the checkpoint identity**, so the preflight's
+  cross-rank agreement check would pass:
+
+  ```
+  digest      = 3a7f5ce2b986c2300e8381b1f1c089e7342abe0fa95a16b4102f87077b3a56c7
+  file_count  = 50
+  total_bytes = 510304181917   (475.3 GiB)
+  ```
 
 The Engram reader and the N-rank generalization remain covered by unit tests
 only. They have not executed against real weights.

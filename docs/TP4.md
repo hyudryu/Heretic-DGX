@@ -288,10 +288,28 @@ workspace as `_tools/farm.sh`.
   (on GB10, unified memory) is shared with the GPU pool.
 - Row reads are positional (`preadv`) and page-cache friendly; the working set
   is small because of the de-duplication.
-- **Expect the preflight to be slow.** It hashes every payload file, so each
-  run reads the full 475 GiB checkpoint once per node, and ranks are
-  preflighted sequentially over SSH. That is minutes, not seconds, on every
-  run including each staged resume.
+- **Expect the preflight to be slow, and now know how slow.** It hashes every
+  payload file, so each run reads the full 475 GiB checkpoint once per node, and
+  ranks are preflighted sequentially over SSH. Measured against this checkpoint
+  by running the gate directly (`python -m heretic.checkpoint_identity`):
+
+  | Node | Wall clock |
+  |---|---|
+  | `gx10-node-1` | 556 s |
+  | `gx10-node-2` | 590 s |
+  | `gx10-node-3` | 544 s |
+  | `spark-node-4` | 702 s |
+
+  That is roughly **9-12 minutes per node**, and about **37 minutes** for a
+  full four-rank preflight run sequentially over SSH — on *every* run, including
+  each staged resume. Budget for it, and do not mistake it for a hang. All four
+  nodes produce the same identity:
+
+  ```
+  digest      = 3a7f5ce2b986c2300e8381b1f1c089e7342abe0fa95a16b4102f87077b3a56c7
+  file_count  = 50
+  total_bytes = 510304181917   (475.3 GiB)
+  ```
 
 ---
 
