@@ -104,19 +104,19 @@ class FakeTransport:
     def _active(self) -> str | None:
         return self.loaded[-1] if self.loaded else None
 
-    def generate(self, prompts, *, max_tokens, temperature, lora_name):
+    def generate(self, messages, *, max_tokens, temperature, lora_name):
         self.generation_lora_names.append(lora_name)
-        return [GenerationResult(text="ok", token_ids=(1,)) for _ in prompts]
+        return [GenerationResult(text="ok", token_ids=(1,)) for _ in messages]
 
-    def raw_logits(self, prompts, *, lora_name):
+    def raw_logits(self, messages, *, lora_name):
         self.logits_lora_names.append(lora_name)
         if not self.return_raw_logits:
-            return torch.zeros(len(prompts), self.vocab)
-        return torch.randn(len(prompts), self.vocab)
+            return torch.zeros(len(messages), self.vocab)
+        return torch.randn(len(messages), self.vocab)
 
-    def hidden_states(self, prompts, *, layer_ids, lora_name):
+    def hidden_states(self, messages, *, layer_ids, lora_name):
         self.hidden_lora_names.append(lora_name)
-        return torch.randn(len(prompts), len(layer_ids), D_OUT)
+        return torch.randn(len(messages), len(layer_ids), D_OUT)
 
     def load_lora(self, name, path):
         self.loaded.append(name)
@@ -352,8 +352,8 @@ class TestResidualShape(unittest.TestCase):
 
     def test_capture_width_mismatch_fails_closed(self) -> None:
         class BadWidth(FakeTransport):
-            def hidden_states(self, prompts, *, layer_ids, lora_name):
-                return torch.randn(len(prompts), len(layer_ids), D_OUT + 3)
+            def hidden_states(self, messages, *, layer_ids, lora_name):
+                return torch.randn(len(messages), len(layer_ids), D_OUT + 3)
 
         runtime = DeepSeekV41Runtime(
             _settings(), transport=BadWidth(), plan=_fabricated_plan()
@@ -520,13 +520,14 @@ class TestPromptRendering(unittest.TestCase):
         """The release ships no Jinja template; the native encoder owns format."""
 
         transport = FakeTransport()
-        captured: list[list[str]] = []
+        # One entry per generate() call; each entry is that call's whole batch.
+        captured: list[list[list[dict[str, str]]]] = []
 
         class Capturing(FakeTransport):
-            def generate(self, prompts, *, max_tokens, temperature, lora_name):
-                captured.append(list(prompts))
+            def generate(self, messages, *, max_tokens, temperature, lora_name):
+                captured.append(list(messages))
                 return super().generate(
-                    prompts,
+                    messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     lora_name=lora_name,
@@ -536,17 +537,25 @@ class TestPromptRendering(unittest.TestCase):
             _settings(), transport=Capturing(), plan=_fabricated_plan()
         )
         runtime.get_responses([Prompt(system="You are helpful.", user="What is 1+1?")])
-        self.assertEqual(captured, [["You are helpful.\n\nWhat is 1+1?"]])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            captured[0][0],
+            [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "What is 1+1?"},
+            ],
+        )
         del transport
 
     def test_response_prefix_is_preserved(self) -> None:
-        captured: list[list[str]] = []
+        # One entry per generate() call; each entry is that call's whole batch.
+        captured: list[list[list[dict[str, str]]]] = []
 
         class Capturing(FakeTransport):
-            def generate(self, prompts, *, max_tokens, temperature, lora_name):
-                captured.append(list(prompts))
+            def generate(self, messages, *, max_tokens, temperature, lora_name):
+                captured.append(list(messages))
                 return super().generate(
-                    prompts,
+                    messages,
                     max_tokens=max_tokens,
                     temperature=temperature,
                     lora_name=lora_name,
@@ -558,7 +567,71 @@ class TestPromptRendering(unittest.TestCase):
             plan=_fabricated_plan(),
         )
         runtime.get_responses([Prompt(system="s", user="u")])
-        self.assertEqual(captured, [["s\n\nuAnswer: "]])
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(
+            captured[0][0],
+            [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+                {"role": "assistant", "content": "Answer: "},
+            ],
+        )
+
+
+class TestChatSurface(unittest.TestCase):
+    """The chat surface is used because the raw completions surface is dead here.
+
+    Verified against the live deployment: `/v1/completions` returns "" with
+    finish_reason "stop" after one token for this model, because the prompt is
+    never wrapped in the native conversation format.
+    """
+
+    def test_continuation_is_requested_for_a_response_prefix(self) -> None:
+        from heretic.deepseek_v41_runtime import HttpVllmTransport
+
+        messages = [
+            [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+                {"role": "assistant", "content": "Answer: "},
+            ]
+        ]
+        self.assertEqual(
+            HttpVllmTransport._continuation(messages),
+            {"continue_final_message": True, "add_generation_prompt": False},
+        )
+
+    def test_no_continuation_without_an_assistant_turn(self) -> None:
+        from heretic.deepseek_v41_runtime import HttpVllmTransport
+
+        messages = [[{"role": "user", "content": "u"}]]
+        self.assertEqual(HttpVllmTransport._continuation(messages), {})
+
+    def test_chat_completion_body_is_parsed(self) -> None:
+        from heretic.deepseek_v41_runtime import HttpVllmTransport
+
+        transport = HttpVllmTransport("http://127.0.0.1:8002", "deepseek-v4.1-flash")
+        captured: list[tuple[str, dict]] = []
+
+        def fake_post(path, payload):
+            captured.append((path, payload))
+            return {
+                "choices": [
+                    {"index": 0, "message": {"role": "assistant", "content": "2"}}
+                ]
+            }
+
+        transport._post = fake_post  # type: ignore[method-assign]
+        results = transport.generate(
+            [[{"role": "user", "content": "What is 1+1?"}]],
+            max_tokens=8,
+            temperature=0.0,
+            lora_name=None,
+        )
+        self.assertEqual(results[0].text, "2")
+        self.assertEqual(captured[0][0], "/v1/chat/completions")
+        self.assertIn("messages", captured[0][1])
+        self.assertNotIn("prompt", captured[0][1])
 
 
 if __name__ == "__main__":

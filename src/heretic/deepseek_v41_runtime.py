@@ -73,6 +73,15 @@ if TYPE_CHECKING:
 
 BACKEND_NAME = "vllm_deepseek_v41"
 
+#: One conversation in OpenAI chat format.
+#:
+#: This is not a stylistic choice. Verified against the live deployment: this
+#: model's raw ``/v1/completions`` surface returns an empty string with
+#: ``finish_reason="stop"`` after one token, because the prompt is never wrapped
+#: in the native conversation format. Only the chat surface reaches the
+#: deployment's ``tokenizer_mode="deepseek_v41"`` encoder.
+ChatMessages = list[dict[str, str]]
+
 #: Layer whose residual width we validate capture against.
 _PROBE_LAYER = 0
 
@@ -105,18 +114,20 @@ class VllmTransport(Protocol):
 
     def generate(
         self,
-        prompts: list[str],
+        messages: list[ChatMessages],
         *,
         max_tokens: int,
         temperature: float,
         lora_name: str | None,
     ) -> list[GenerationResult]: ...
 
-    def raw_logits(self, prompts: list[str], *, lora_name: str | None) -> Tensor: ...
+    def raw_logits(
+        self, messages: list[ChatMessages], *, lora_name: str | None
+    ) -> Tensor: ...
 
     def hidden_states(
         self,
-        prompts: list[str],
+        messages: list[ChatMessages],
         *,
         layer_ids: tuple[int, ...],
         lora_name: str | None,
@@ -192,34 +203,36 @@ class HttpVllmTransport:
 
     def generate(
         self,
-        prompts: list[str],
+        messages: list[ChatMessages],
         *,
         max_tokens: int,
         temperature: float,
         lora_name: str | None,
     ) -> list[GenerationResult]:
         body = self._post(
-            "/v1/completions",
+            "/v1/chat/completions",
             {
                 "model": self.model_name,
-                "prompt": prompts,
+                "messages": messages,
                 "max_tokens": max_tokens,
                 "temperature": temperature,
+                **self._continuation(messages),
                 **self._extra_body(lora_name),
             },
         )
         choices = body.get("choices")
-        if not isinstance(choices, list) or len(choices) != len(prompts):
+        if not isinstance(choices, list) or len(choices) != len(messages):
             raise BackendUnavailable(
                 "vLLM returned an unexpected number of completions: "
-                f"expected {len(prompts)}, got "
+                f"expected {len(messages)}, got "
                 f"{len(choices) if isinstance(choices, list) else 'none'}"
             )
         results: list[GenerationResult] = []
         for choice in sorted(choices, key=lambda item: item.get("index", 0)):
-            text = choice.get("text")
+            message = choice.get("message")
+            text = message.get("content") if isinstance(message, dict) else None
             if not isinstance(text, str):
-                raise BackendUnavailable("vLLM completion is missing text")
+                raise BackendUnavailable("vLLM chat completion is missing content")
             token_ids: tuple[int, ...] = ()
             token_ids_raw = choice.get("token_ids")
             if isinstance(token_ids_raw, list):
@@ -227,7 +240,23 @@ class HttpVllmTransport:
             results.append(GenerationResult(text=text, token_ids=token_ids))
         return results
 
-    def raw_logits(self, prompts: list[str], *, lora_name: str | None) -> Tensor:
+    @staticmethod
+    def _continuation(messages: list[ChatMessages]) -> dict[str, Any]:
+        """Continue an assistant turn when Heretic supplies a response prefix.
+
+        Heretic appends ``response_prefix`` so that scoring happens at the point
+        where responses start to differ. In chat form the faithful equivalent is
+        a final assistant message that the model continues, which vLLM exposes as
+        ``continue_final_message``.
+        """
+
+        if messages and messages[-1] and messages[-1][-1].get("role") == "assistant":
+            return {"continue_final_message": True, "add_generation_prompt": False}
+        return {}
+
+    def raw_logits(
+        self, messages: list[ChatMessages], *, lora_name: str | None
+    ) -> Tensor:
         """Dense ``(batch, vocab)`` raw first-token logits.
 
         ``logprobs=-1`` with ``logprobs_mode="raw_logits"`` is the only
@@ -236,17 +265,18 @@ class HttpVllmTransport:
         """
 
         body = self._post(
-            "/v1/completions",
+            "/v1/chat/completions",
             {
                 "model": self.model_name,
-                "prompt": prompts,
+                "messages": messages,
                 "max_tokens": 1,
                 "temperature": 0,
                 "logprobs": -1,
+                **self._continuation(messages),
                 **self._extra_body(lora_name),
             },
         )
-        return self._reconstruct_logits(body, len(prompts))
+        return self._reconstruct_logits(body, len(messages))
 
     def _reconstruct_logits(self, body: dict[str, Any], batch: int) -> Tensor:
         """Rebuild a dense ``(batch, vocab)`` tensor in token-ID order.
@@ -300,7 +330,7 @@ class HttpVllmTransport:
 
     def hidden_states(
         self,
-        prompts: list[str],
+        messages: list[ChatMessages],
         *,
         layer_ids: tuple[int, ...],
         lora_name: str | None,
@@ -309,14 +339,14 @@ class HttpVllmTransport:
             self.capture_layer_path,
             {
                 "model": self.model_name,
-                "prompt": prompts,
+                "messages": messages,
                 "layer_ids": list(layer_ids),
                 "position": "last",
                 **self._extra_body(lora_name),
             },
         )
         states = body.get("hidden_states")
-        if not isinstance(states, list) or len(states) != len(prompts):
+        if not isinstance(states, list) or len(states) != len(messages):
             raise BackendUnavailable(
                 "hidden-state endpoint returned an unexpected batch size"
             )
@@ -644,26 +674,29 @@ class DeepSeekV41Runtime(ModelRuntime):
 
     # -- inference --------------------------------------------------------
 
-    def _render(self, prompts: list[Prompt]) -> list[str]:
-        """Render prompts for the native V4.1 encoder.
+    def _render(self, prompts: list[Prompt]) -> list[ChatMessages]:
+        """Render prompts as chat messages for the native V4.1 encoder.
 
-        This release ships no Jinja chat template, so ``apply_chat_template`` is
-        never called here. The deployment is configured with
-        ``tokenizer_mode="deepseek_v41"``, which owns the real prompt format.
-        Heretic's semantics are preserved: system prompt, then user prompt, then
-        the configured response prefix.
+        ``apply_chat_template`` is never called here: the checkpoint ships no
+        Jinja template. Prompt encoding belongs to the deployment's
+        ``tokenizer_mode="deepseek_v41"`` path, which is reachable only through
+        the chat-completions surface.
+
+        Heretic's semantics are preserved -- system prompt, then user prompt --
+        and ``response_prefix`` becomes a final assistant turn to continue.
         """
 
-        rendered = []
+        rendered: list[ChatMessages] = []
         for prompt in prompts:
-            parts = []
+            messages: ChatMessages = []
             if prompt.system:
-                parts.append(prompt.system)
-            parts.append(prompt.user)
-            text = "\n\n".join(parts)
+                messages.append({"role": "system", "content": prompt.system})
+            messages.append({"role": "user", "content": prompt.user})
             if self.settings.response_prefix:
-                text += self.settings.response_prefix
-            rendered.append(text)
+                messages.append(
+                    {"role": "assistant", "content": self.settings.response_prefix}
+                )
+            rendered.append(messages)
         return rendered
 
     def get_responses_once(
