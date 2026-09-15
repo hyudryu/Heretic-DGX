@@ -203,3 +203,25 @@ A patch that loads is not a patch that works. The cheap check is whether the
 refusal count actually moves; the current profile's best result is 94/100
 against a baseline of 98/99, and a fix that is real should move that number
 substantially rather than by four points.
+
+### The pre-patch baseline is already saved
+
+Once the patch is deployed the unpatched engine no longer exists, so the
+mean-collapsed directions cannot be regenerated — and without them there is no
+A/B, only a before/after refusal count that cannot say *whether the directions
+changed*. That is the actual claim under test, so the baseline was captured
+while it was still reproducible:
+
+```
+/home/hyudryu/.cache/huggingface/heretic-baseline-mean-collapse.pt    (834 KB)
+/home/hyudryu/.cache/huggingface/heretic-baseline-mean-collapse.json
+```
+
+It holds a unit direction per entering layer (1…40) derived from the
+mean-collapsed capture, plus `mean_norm`, `delta_norm` and `rel_sep` per layer,
+and is produced by `scripts/save_baseline.py` from the captures written by
+`scripts/diag_direction.py`.
+
+After the patch, re-run `diag_direction.py` and compare the two direction sets —
+a cosine well below 1 between the old and new directions *is* the confirmation,
+independent of whether refusals move.
