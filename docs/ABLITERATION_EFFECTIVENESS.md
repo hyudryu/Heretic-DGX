@@ -229,6 +229,31 @@ specific to V4.1 rather than to Heretic.
    This is consistent with every other measurement and requires no new
    hypothesis to explain the ~4% ceiling.
 
+   **The fix this points to.** vLLM already computes the value we actually want.
+   In the same call, `mhc_pre_delayed_tilelang` returns `attn_pre` alongside `x`:
+
+   ```python
+   post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(residual, ..., norm_weight=self.attn_norm.weight)
+   x = self.attn(positions, x, None)
+   ```
+
+   `x` is what attention consumes; `attn_pre` is the collapsed stream returned
+   by the same call and discarded. The capture mechanism instead takes
+   `mhc_post_tilelang(...).mean(dim=1)` — a *layer-output* reconstruction
+   collapsed by a plain mean. Capturing the mix-weighted pre-attention stream
+   instead would put the measured directions, and the ablation, in the same
+   space by construction.
+
+   That requires a small patch to the model's aux-hidden-state emission, since
+   the mean-collapse is deliberate — it is what EAGLE/DSpark drafters consume,
+   not an oversight. SparkDeck's `create_patched_image` exists to build a named
+   image from added files, so this does not need a fork.
+
+   This is the strongest candidate for the real fix, and it is checkable in one
+   step: capture `attn_pre` for a handful of prompts, compare the resulting
+   directions against the mean-collapsed ones, and see whether the ablation
+   finally moves refusals.
+
 ## The search space is fully explored, and strength does nothing
 
 This is judged from the journal already on disk — 65 scored trials, no pause and
