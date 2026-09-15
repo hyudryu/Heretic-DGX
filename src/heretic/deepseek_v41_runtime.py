@@ -238,8 +238,21 @@ class HttpVllmTransport:
             raise BackendUnavailable(f"vLLM returned a non-object body from {path}")
         return decoded
 
-    #: Total attempts per request, including the first.
-    MAX_ATTEMPTS = 4
+    #: Total attempts per request, including the first. With the backoff below
+    #: this spans roughly 90 seconds.
+    #:
+    #: The width matters. A fixed four attempts with 1/2/3s sleeps spans ~6s,
+    #: which is useless against the failure actually observed in production: the
+    #: engine restarting. Reloading this checkpoint takes minutes, and while it
+    #: is down the shim answers 502 or refuses the connection -- so a 6s budget
+    #: guarantees the trial fails. ~90s rides out a short restart, and stays far
+    #: inside the backend's own vllm_timeout_seconds (600), so the caller still
+    #: owns the hard deadline.
+    MAX_ATTEMPTS = 8
+
+    #: Ceiling on the exponential backoff, so a long outage does not turn into
+    #: minute-long sleeps between the last few attempts.
+    MAX_BACKOFF_SECONDS = 30.0
 
     #: Statuses that mean "the upstream was momentarily unavailable" rather
     #: than "your request was wrong". Observed in practice: the shim answered
@@ -248,17 +261,17 @@ class HttpVllmTransport:
     TRANSIENT_STATUSES = frozenset({429, 502, 503, 504})
 
     def _send(self, request: urllib.request.Request, path: str) -> bytes:
-        """POST with retries on transient failures.
+        """POST with exponential backoff on transient failures.
 
         A multi-hour optimization run will eventually hit a dropped connection
-        or a briefly unavailable upstream (shim restart, engine hiccup). Every
+        or a briefly unavailable upstream (shim restart, engine restart). Every
         endpoint used here is safe to retry: reads are idempotent, and load_lora
         replaces rather than accumulates.
 
         Only genuinely transient statuses are retried (see
         ``TRANSIENT_STATUSES``). Other 4xx and 5xx codes are deterministic
         answers about the request itself, so they fail immediately rather than
-        burning three retries on a request that cannot succeed.
+        burning retries on a request that cannot succeed.
         """
 
         last_error: Exception | None = None
@@ -274,14 +287,12 @@ class HttpVllmTransport:
                 if error.code not in self.TRANSIENT_STATUSES:
                     raise failure from error
                 last_error = failure
-                if attempt < self.MAX_ATTEMPTS - 1:
-                    time.sleep(1.0 * (attempt + 1))
             except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
                 last_error = error
-                if attempt < self.MAX_ATTEMPTS - 1:
-                    time.sleep(1.0 * (attempt + 1))
+            if attempt < self.MAX_ATTEMPTS - 1:
+                time.sleep(min(self.MAX_BACKOFF_SECONDS, 2.0**attempt))
         raise BackendUnavailable(
-            f"vLLM at {self.base_url} is unreachable after {self.MAX_ATTEMPTS} "
+            f"vLLM at {self.base_url} still unavailable after {self.MAX_ATTEMPTS} "
             f"attempts: {last_error}"
         ) from last_error
 

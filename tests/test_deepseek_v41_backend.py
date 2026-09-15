@@ -453,7 +453,52 @@ class TestExactLogits(unittest.TestCase):
             with self.assertRaises(BackendUnavailable) as caught:
                 call()
         self.assertEqual(opened.call_count, http.MAX_ATTEMPTS)
-        self.assertIn("after 4 attempts", str(caught.exception))
+        self.assertIn(f"after {http.MAX_ATTEMPTS} attempts", str(caught.exception))
+
+    def test_retry_backoff_spans_minutes_not_seconds(self) -> None:
+        """The retry window must be able to outlast an engine restart.
+
+        This is not theoretical. A previous study died when the engine
+        restarted: the shim logged `ConnectionRefusedError` and `Remote end
+        closed connection without response` until the engine came back. Reloading
+        this checkpoint takes minutes, so a budget of a few seconds guarantees
+        the trial fails while a wider one rides it out.
+
+        The sleeps are what matter here, so assert on the schedule rather than
+        on wall-clock time.
+        """
+
+        import urllib.error
+        import urllib.request
+
+        from heretic.deepseek_v41_runtime import BackendUnavailable, HttpVllmTransport
+
+        http = HttpVllmTransport("http://127.0.0.1:8000", "m")
+        slept: list[float] = []
+
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.URLError("engine restarting"),
+            ),
+            patch(
+                "heretic.deepseek_v41_runtime.time.sleep",
+                side_effect=slept.append,
+            ),
+        ):
+            with self.assertRaises(BackendUnavailable):
+                http._send(
+                    urllib.request.Request("http://127.0.0.1:8000/v1/x", data=b"{}"),
+                    "/v1/x",
+                )
+
+        # Exponential, then flat at the ceiling -- never longer.
+        self.assertEqual(slept, [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0])
+        self.assertTrue(all(s <= http.MAX_BACKOFF_SECONDS for s in slept))
+        # Total backoff is the point: it must be minutes, not seconds.
+        self.assertGreaterEqual(sum(slept), 60.0)
+        # ...and still leave room inside the backend's own timeout.
+        self.assertLess(sum(slept), 600.0)
 
     def test_lora_action_bodies_need_not_be_json(self) -> None:
         """vLLM answers adapter load/unload with an empty or plain-text body."""
