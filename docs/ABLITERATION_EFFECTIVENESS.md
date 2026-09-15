@@ -186,23 +186,112 @@ specific to V4.1 rather than to Heretic.
 Hypothesis 2 is the more specific and the more likely to be decisive, because it
 is a property of this architecture that Heretic has never been run against.
 
+## The search space is fully explored, and strength does nothing
+
+This is judged from the journal already on disk — 65 scored trials, no pause and
+no engine load. Reproduce with `scripts/analyse_search.py` and
+`scripts/read_search_space.py`.
+
+### Correlation between searched parameters and the refusal count
+
+| parameter | pearson | spearman | range explored |
+|---|---|---|---|
+| `max_weight` | **0.028** | **0.131** | 0.80 – 1.50 |
+| `max_weight_position` | 0.364 | 0.305 | 23.50 – 38.67 |
+| `min_weight` | −0.348 | −0.239 | 0.01 – 1.37 |
+| `min_weight_distance` | **−0.471** | **−0.489** | 1.70 – 23.34 |
+
+Split by strength, the refusal count is flat:
+
+```
+weakest 25%    max_weight 0.80-0.93   refusals mean 97.44   KL mean 0.0323
+        Q2     max_weight 0.93-1.18   refusals mean 97.19   KL mean 0.0317
+        Q3     max_weight 1.20-1.34   refusals mean 97.62   KL mean 0.0261
+strongest 25%  max_weight 1.34-1.50   refusals mean 97.35   KL mean 0.0300
+```
+
+**Ablation strength moves neither refusals nor KL.** Coverage
+(`min_weight_distance`) does move both, so the ablation *is* reaching the
+refusal mechanism — just far too weakly to matter.
+
+### And the strength range was exhausted, not merely sampled
+
+Bounds Optuna recorded, against what it actually tried:
+
+| parameter | low | high | observed min | observed max |
+|---|---|---|---|---|
+| `attn.o_proj.max_weight` | 0.8 | 1.5 | 0.804 | **1.498** |
+| `attn.o_proj.max_weight_position` | 23.4 | 39.0 | 23.501 | 38.668 |
+| `attn.o_proj.min_weight` | 0.0 | 1.0 | 0.005 | 1.000 |
+| `attn.o_proj.min_weight_distance` | 1.0 | 23.4 | 1.703 | 23.338 |
+
+`max_weight` was pushed edge to edge. So the flat correlation is **not** an
+artefact of under-exploration: strength was fully explored and is irrelevant
+here. These bounds are Heretic's own defaults, derived from `last_layer_index`,
+not a misconfiguration (`src/heretic/main.py`):
+
+```python
+max_weight_lower_bound = -0.25 if component == "mlp.down_proj" else 0.8
+max_weight = max(0.0, trial.suggest_float(f"{component}.max_weight", max_weight_lower_bound, 1.5))
+max_weight_position = trial.suggest_float(..., 0.6 * last_layer_index, 1.0 * last_layer_index)
+min_weight_distance = trial.suggest_float(..., 1.0, max(0.6 * last_layer_index, 1.0))
+```
+
+**Conclusion: the attention-only parameterization cannot remove refusals on this
+model. Additional trials cannot fix it** — the dimension that would need to grow
+is already at its ceiling, and it has no effect at all.
+
+## Widening the ablation: Heretic says to, but the architecture resists
+
+The source points at `mlp.down_proj` as the second component (see the comment at
+`main.py:778-783`, and the −0.25 lower bound that lets the optimizer disable it).
+On most models ablating the attention output alone suffices; here it does not.
+
+**But V4.1 has no single `mlp.down_proj`.** The checkpoint tensor census:
+
+```
+  15360  layers.N.ffn.experts.E.w2.weight        (384 routed experts x 40 layers)
+     40  layers.N.ffn.shared_experts.w2.weight   (one always-active dense path)
+     40  layers.N.ffn.gate.weight
+     40  layers.N.hc_attn_{base,fn,scale}        (hyper-connection parameters)
+     40  layers.N.hc_ffn_{base,fn,scale}
+```
+
+So Heretic's `mlp.down_proj` component — which assumes one down projection per
+layer — has no direct referent. The options are:
+
+- **All 384 routed experts.** 15,360 tensors. At rank 3 this is roughly a
+  1.3 GB adapter, which the shim would have to rsync to three peers *on every
+  trial*. At ~13 minutes per trial that I/O is prohibitive, so this is not a
+  practical V1 path.
+- **The shared expert only** (`ffn.shared_experts.w2`, 40 tensors). This is the
+  cheap option: the same tensor count as `wo_b`, a dense path that is always
+  active rather than routed, and therefore plausibly a place refusal is written.
+  This is the most promising next experiment.
+
+Either way, the engine must be relaunched with the new module in
+`--lora-target-modules`, and both the target discovery in
+`deepseek_v41_targets.py` and the runtime would need to handle it.
+
+The presence of `hc_attn_*` / `hc_ffn_*` parameters is also direct confirmation
+that the hyper-connection representation is real and per-layer, which is the
+premise of architectural hypothesis 2 above.
+
 ## The decisive experiment (needs the study paused)
 
-Load a deliberately extreme adapter — `max_weight` at the top of its range and
-`min_weight_distance` at 23.34 so every layer is covered — then re-measure with
-`scripts/measure_refusal_rate.py`:
+Two experiments, in order of cost. Both need the study paused, because the
+engine runs `--max-loras 1` and a probe adapter would displace `heretic-trial`:
 
-- **Refusals collapse toward zero** → the mechanism works and full strength was
-  simply never explored; the problem is the objective's dynamic range.
-- **Refusals barely move at maximum strength** → strength is not the variable,
-  and hypothesis 1 or 2 is correct.
+1. **Extreme attention-only adapter.** `max_weight` is already at its ceiling
+   with no effect, so this is now near-certain to fail — it is worth running only
+   to close the question definitively.
+2. **Add the shared-expert down projection** to the ablation targets. This is the
+   experiment with actual information in it.
 
-Either outcome is decisive, and it takes minutes rather than the 28 hours the
-current search has left.
-
-This cannot be run alongside the study: the engine is configured with
-`--max-loras 1`, so loading a probe adapter would displace `heretic-trial` and
-destroy the in-flight trial.
+Note that the watchdog installed earlier restarts the study whenever the process
+is missing, so pausing means stopping the watchdog first (`sudo pkill -f
+heretic-watchdog`) and restarting it afterwards. That also makes a pause cheap
+and fully reversible.
 
 ## Consequences for the running study
 
