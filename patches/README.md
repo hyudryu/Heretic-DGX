@@ -4,6 +4,27 @@
 uses `vllm-dsv41:pinned-ehs2`; the patched image sits beside it as
 `vllm-dsv41:pinned-ehs3-hccollapse`.
 
+> ## ⚠️ This image must never serve the production profile.
+>
+> The aux hidden states have **two** consumers, and the mean-collapse is correct
+> for one of them.
+>
+> | consumer | what it does | effect of this patch |
+> |---|---|---|
+> | `extract_hidden_states` (Heretic) | `torch.stack(target_hidden_states, dim=1)`, then store — no learned projection (`v1/spec_decode/extract_hidden_states.py:127`) | **exactly what we want** |
+> | EAGLE3 / DSpark drafter (production) | `main_norm(main_proj(aux_hidden_states))` (`models/deepseek_v4_1/nvidia/dspark.py:148-153`), called from `v1/worker/gpu/spec_decode/dflash/speculator.py:347` | **feeds the drafter out-of-distribution inputs** |
+>
+> The DSpark draft model was trained against **mean-collapsed** hidden states and
+> applies a learned projection to them. `.mean(dim=1)` is therefore *correct for
+> vLLM's purpose* — it is the drafter's input distribution, not a bug. It is only
+> wrong for abliteration, which needs the residual stream the model actually
+> consumes.
+>
+> Consequence: use `pinned-ehs3-hccollapse` **only** with
+> `--speculative-config … extract_hidden_states`. Reusing it with the production
+> `dspark` profile would silently degrade speculative decoding rather than fail
+> loudly. The production profile must keep `vllm-dsv41:pinned`.
+
 Read [`../docs/ABLITERATION_EFFECTIVENESS.md`](../docs/ABLITERATION_EFFECTIVENESS.md)
 for why this was necessary.
 
@@ -93,20 +114,44 @@ line present, the old assignment absent.
 
 ## Deploying it
 
-**This needs the study stopped**, because the change only takes effect when the
-engine restarts:
+**Prepared, not executed.** `scripts/deploy_hc_collapse_patch.sh` performs the
+whole transition; read it before running it, because it stops a run the user
+asked for.
 
-1. `sudo pkill -f heretic-watchdog` — otherwise it restarts the study within 60s.
-2. Stop deployment `8fd087c422c5` and stop the study process.
-3. Update the deployment's `image` to `vllm-dsv41:pinned-ehs3-hccollapse`.
-4. Start it; wait for ready.
-5. Restart the shim, then the study (`checkpoint_action = "continue"` resumes
-   from the Optuna journal, losing only the in-flight trial).
-6. Restart the watchdog.
-7. **Verify before trusting it.** Run `scripts/diag_direction.py` against the
-   patched engine and compare the resulting directions with the mean-collapsed
-   ones, then `scripts/measure_refusal_rate.py` for the only measurement that
-   decides anything.
+The deployment recipe already exists: **`ff09e9a8`** —
+*"Heretic abliteration - V4.1 TP4 (hc-collapse patch)"*. It was built by reading
+the **live** deployment's own configuration and changing exactly one field, so
+its 49 `extra_args` and 34 environment variables are the validated profile
+verbatim rather than a hand-transcription. `scripts/make_patched_recipe.py`
+regenerates it and refuses to build if the live profile is not using
+`extract_hidden_states`, or if `dspark` appears anywhere in its spec.
 
-A fresh study is required rather than a resumed one: the old Optuna study's
-trials were scored against directions that no longer describe the capture.
+The script's ordering, and why:
+
+1. `sudo pkill -f heretic-watchdog` — otherwise it restarts the study within 60s
+2. stop the study (it has no supervisor other than the watchdog)
+3. stop deployment `8fd087c422c5` — one 552B model, four Sparks; the old engine
+   must go before the new one starts
+4. deploy recipe `ff09e9a8`
+5. wait for ready (the engine reloads 475 GB, ~10 minutes)
+6. restart the shim — it hardcodes its upstream port at startup, so it must be
+   pointed at the new rank-0 port
+7. archive the old journal
+8. start the fresh study
+9. **verify** — `scripts/diag_direction.py` then `scripts/measure_refusal_rate.py`
+10. restart the watchdog
+
+### A fresh study is required, not a resume
+
+The 69 trials in the existing journal were scored against directions computed
+from the **mean-collapsed** capture. After the patch those directions no longer
+describe what the engine emits, so `checkpoint_action = "continue"` would resume
+a search whose history was measured in a different space. The script archives
+the journal instead of continuing it.
+
+### Do not commit to a long search until step 9 passes
+
+A patch that loads is not a patch that works. The cheap check is whether the
+refusal count actually moves; the current profile's best result is 94/100
+against a baseline of 98/99, and a fix that is real should move that number
+substantially rather than by four points.

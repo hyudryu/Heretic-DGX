@@ -73,6 +73,7 @@ the speedup for a data-collection profile.
 """
 
 import json
+import os
 import sys
 
 sys.path.insert(0, __file__.rsplit("\\", 1)[0])
@@ -91,7 +92,13 @@ REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
 # dies at worker startup with "does not support LoRA yet"). Adapter names
 # resolve through the wrapper's existing hf_to_vllm_mapper
 # (layers. -> language_model.model.layers.).
-IMAGE = "vllm-dsv41:pinned-ehs2"
+# pinned-ehs3-hccollapse = pinned-ehs2 + the hyper-connection collapse patch:
+# the aux hidden state is collapsed with the carried pre-mix instead of a plain
+# mean (patches/README.md). Heretic-only -- that collapse is wrong for the
+# production DSpark drafter, which was trained against mean-collapsed states.
+#
+# Override with HERETIC_IMAGE when building the recipe for the patched profile.
+IMAGE = os.environ.get("HERETIC_IMAGE", "vllm-dsv41:pinned-ehs2")
 NODES = [
     "local",
     "fec2d563f9a1424fbb901e323e2fc0c0",
