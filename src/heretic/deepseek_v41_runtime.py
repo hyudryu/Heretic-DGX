@@ -238,32 +238,51 @@ class HttpVllmTransport:
             raise BackendUnavailable(f"vLLM returned a non-object body from {path}")
         return decoded
 
+    #: Total attempts per request, including the first.
+    MAX_ATTEMPTS = 4
+
+    #: Statuses that mean "the upstream was momentarily unavailable" rather
+    #: than "your request was wrong". Observed in practice: the shim answered
+    #: 502 "Remote end closed connection without response", which failed trial
+    #: 43 and cost ~13 minutes of a 33-hour study.
+    TRANSIENT_STATUSES = frozenset({429, 502, 503, 504})
+
     def _send(self, request: urllib.request.Request, path: str) -> bytes:
-        """POST with retries on transient connection failures.
+        """POST with retries on transient failures.
 
         A multi-hour optimization run will eventually hit a dropped connection
-        (proxy restart, engine hiccup). All endpoints used here are safe to
-        retry: reads are idempotent, and load_lora replaces rather than
-        accumulates. HTTP errors (4xx/5xx) are not retried -- they are
-        deterministic answers, not transients.
+        or a briefly unavailable upstream (shim restart, engine hiccup). Every
+        endpoint used here is safe to retry: reads are idempotent, and load_lora
+        replaces rather than accumulates.
+
+        Only genuinely transient statuses are retried (see
+        ``TRANSIENT_STATUSES``). Other 4xx and 5xx codes are deterministic
+        answers about the request itself, so they fail immediately rather than
+        burning three retries on a request that cannot succeed.
         """
 
         last_error: Exception | None = None
-        for attempt in range(4):
+        for attempt in range(self.MAX_ATTEMPTS):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310
                     return response.read()
             except urllib.error.HTTPError as error:
                 detail = error.read().decode("utf-8", "replace")[:500]
-                raise BackendUnavailable(
+                failure = BackendUnavailable(
                     f"vLLM request to {path} failed with HTTP {error.code}: {detail}"
-                ) from error
+                )
+                if error.code not in self.TRANSIENT_STATUSES:
+                    raise failure from error
+                last_error = failure
+                if attempt < self.MAX_ATTEMPTS - 1:
+                    time.sleep(1.0 * (attempt + 1))
             except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
                 last_error = error
-                if attempt < 3:
+                if attempt < self.MAX_ATTEMPTS - 1:
                     time.sleep(1.0 * (attempt + 1))
         raise BackendUnavailable(
-            f"vLLM at {self.base_url} is unreachable after retries: {last_error}"
+            f"vLLM at {self.base_url} is unreachable after {self.MAX_ATTEMPTS} "
+            f"attempts: {last_error}"
         ) from last_error
 
     @staticmethod

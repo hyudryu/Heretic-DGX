@@ -384,6 +384,96 @@ class TestExactLogits(unittest.TestCase):
             http._reconstruct_logits(body, 1)
         self.assertIn("logprobs=<vocab_size>", str(caught.exception))
 
+    def test_transient_status_is_retried_and_a_real_error_is_not(self) -> None:
+        """A shim 502 must cost a retry, not a trial.
+
+        Observed in production: the shim answered 502
+        ``shim: Remote end closed connection without response``, which failed
+        trial 43 of a 200-trial study -- about 13 minutes lost to a condition
+        that clears on its own.
+
+        A 400 is the opposite case: a determinate answer about the request, so
+        it must fail immediately rather than burn three retries on a request
+        that cannot succeed.
+        """
+
+        import io
+        import urllib.error
+        import urllib.request
+
+        from heretic.deepseek_v41_runtime import BackendUnavailable, HttpVllmTransport
+
+        http = HttpVllmTransport("http://127.0.0.1:8000", "m")
+
+        def http_error(code: int) -> urllib.error.HTTPError:
+            return urllib.error.HTTPError(
+                "http://127.0.0.1:8000/v1/x",
+                code,
+                "boom",
+                None,
+                io.BytesIO(b'{"error": "boom"}'),  # type: ignore[arg-type]
+            )
+
+        def call() -> bytes:
+            return http._send(
+                urllib.request.Request("http://127.0.0.1:8000/v1/x", data=b"{}"),
+                "/v1/x",
+            )
+
+        # Two 502s, then success: the request survives.
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=[http_error(502), http_error(503), io.BytesIO(b'{"ok":1}')],
+            ) as opened,
+            patch("heretic.deepseek_v41_runtime.time.sleep") as slept,
+        ):
+            self.assertEqual(call(), b'{"ok":1}')
+        self.assertEqual(opened.call_count, 3)
+        self.assertEqual(slept.call_count, 2)
+
+        # A 400 fails on the first attempt.
+        with (
+            patch("urllib.request.urlopen", side_effect=[http_error(400)]) as opened,
+            patch("heretic.deepseek_v41_runtime.time.sleep"),
+        ):
+            with self.assertRaises(BackendUnavailable) as caught:
+                call()
+        self.assertEqual(opened.call_count, 1)
+        self.assertIn("HTTP 400", str(caught.exception))
+
+        # A dropped connection is retried, then reported with the attempt count.
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.URLError("connection reset"),
+            ) as opened,
+            patch("heretic.deepseek_v41_runtime.time.sleep"),
+        ):
+            with self.assertRaises(BackendUnavailable) as caught:
+                call()
+        self.assertEqual(opened.call_count, http.MAX_ATTEMPTS)
+        self.assertIn("after 4 attempts", str(caught.exception))
+
+    def test_lora_action_bodies_need_not_be_json(self) -> None:
+        """vLLM answers adapter load/unload with an empty or plain-text body."""
+
+        import io
+
+        from heretic.deepseek_v41_runtime import HttpVllmTransport
+
+        http = HttpVllmTransport("http://127.0.0.1:8000", "m")
+
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(b"")):
+            self.assertEqual(http._post("/v1/load_lora_adapter", {}), {})
+
+        with patch(
+            "urllib.request.urlopen", return_value=io.BytesIO(b"Success: loaded")
+        ):
+            self.assertEqual(
+                http._post("/v1/load_lora_adapter", {}), {"text": "Success: loaded"}
+            )
+
     def _transport(self, temporary: str) -> object:
         from heretic.deepseek_v41_runtime import HttpVllmTransport
 
