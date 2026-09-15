@@ -175,16 +175,35 @@ specific to V4.1 rather than to Heretic.
    written by the expert/MLP path, and by Engram. Heretic supports widening this
    — `abliteration_components` — and V1 deliberately restricted it. Widening it
    is a cheap, high-value experiment.
-2. **The ablation and the measurement may live in different spaces.** The
-   refusal direction is measured on the **collapsed** residual stream (width
-   5120, after the `hc_mult = 4` hyper-connection collapse via `.mean(dim=1)`),
-   but `wo_b` writes into the **pre-collapse** hyper-connection representation.
-   Projecting `d` out of `wo_b`'s output therefore does not necessarily remove
-   `d` from the collapsed stream that the direction was measured on. Nothing in
-   the current pipeline checks for this mismatch.
+2. **The ablation and the measurement may live in different spaces.** Read from
+   the real model (`vllm/models/deepseek_v4_1/nvidia/model.py:347-369`), the
+   decoder layer does:
 
-Hypothesis 2 is the more specific and the more likely to be decisive, because it
-is a property of this architecture that Heretic has never been run against.
+   ```python
+   post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(residual, ..., norm_weight=self.attn_norm.weight)
+   x = self.attn(positions, x, None)                          # attention sees the COLLAPSED stream
+   residual = mhc_post_tilelang(x, residual, post_mix, res_mix)  # output re-expanded into the hc stream
+   ```
+
+   So `wo_b` **does** read and write the collapsed 5120 stream — the same space
+   the refusal direction is measured in. The simpler form of this hypothesis is
+   therefore **dead**, and the "pre-collapse" phrasing used earlier in this
+   document was wrong.
+
+   What survives is sharper: the attention output is re-expanded by
+   `mhc_post_tilelang` into the hyper-connection copies, and the next layer's
+   `mhc_pre_delayed_tilelang` re-collapses them with a **learned,
+   position-dependent mix** (`hc_attn_fn`, `hc_attn_scale`, `hc_attn_base`,
+   `pre_mix`) — *not* the `.mean(dim=1)` that the capture mechanism uses. Both
+   are 5120-dimensional, but they are different linear functionals of the same
+   hc state. Subtracting `d` from `wo_b`'s output therefore reduces the collapsed
+   stream along some direction `d' = collapse(mhc_post(d))`, which is not `d`
+   unless the mixes happen to be uniform.
+
+   Nothing in the pipeline checks this, and it is a property of this
+   architecture that Heretic has never been run against. It is now the leading
+   hypothesis, and it is testable: compare `d` against
+   `collapse(mhc_post(d))` using the layer's own mix weights.
 
 ## The search space is fully explored, and strength does nothing
 

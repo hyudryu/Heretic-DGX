@@ -1,8 +1,22 @@
 # Widening the ablation past `attn.o_proj`
 
-**Status: prepared and mechanically validated, NOT yet run.** Every claim below
-was measured against the real checkpoint, read-only; nothing here has been
-exercised end to end, and it cannot be without stopping the running study.
+> **Read the negative result first.** A follow-up measurement
+> (`scripts/check_direction_share.py`) does **not** support the shared expert as
+> a target: its output space contains the refusal direction at **1.04x** the
+> rate a random subspace of the same dimension would (mean share 0.6972 against
+> a 0.6708 baseline, with only 2 of 40 layers above 1.1x). So it is not
+> specially oriented toward refusal.
+>
+> That is a weak test — it bounds what the projection *can* write, not what it
+> actually writes, since a component could be at baseline alignment and still
+> carry the signal. But the honest reading is that the shared expert is a
+> **cheap** candidate, not a **promising** one. Earlier phrasing in this
+> document oversold it. The mechanics below still hold and still make it worth
+> one load test, because a load test costs minutes.
+
+**Status: prepared and mechanically validated, NOT yet run.** Every mechanical
+claim below was measured against the real checkpoint, read-only; nothing here has
+been exercised end to end, and it cannot be without stopping the running study.
 
 Read [`ABLITERATION_EFFECTIVENESS.md`](ABLITERATION_EFFECTIVENESS.md) first. The
 short version: the attention-only search space is exhausted, ablation strength
