@@ -172,3 +172,86 @@ Generated deployments carry `managed_by: sparkdeck-mcp`, so start/stop does not
 require `allow_unowned`. The older recipe `5ae70a64` is the ancestor of the live
 profile; the live one additionally overrides the image to `pinned-ehs2` and adds
 the LoRA flags and `VLLM_ALLOW_RUNTIME_LORA_UPDATING`.
+
+---
+
+## Operations: keeping a 33-hour run alive
+
+### Supervision
+
+Neither the study nor the shim was supervised — both were orphans parented to
+PID 1. A previous run reached 9h30m and then died when the engine restarted, and
+nothing brought it back.
+
+`scripts/heretic_watchdog.sh` fixes that. It runs every 60 s and restarts
+whichever of the two is missing, with a 300 s cooldown so a genuinely broken
+study cannot be hammered into a fork bomb. It **never touches a running study**,
+and it deliberately refuses to restart the study while the engine is unhealthy —
+a study launched into a dead engine burns Optuna trials on guaranteed failures,
+which is worse than waiting.
+
+```sh
+sudo install -m 0755 scripts/heretic_watchdog.sh /usr/local/bin/heretic-watchdog
+sudo setsid nohup /usr/local/bin/heretic-watchdog </dev/null >/dev/null 2>&1 &
+```
+
+**The detection patterns must stay anchored to the interpreter path.** A loose
+pattern like `bin/heretic --model` also matches the *launcher shell*, whose own
+command line contains the entire heretic invocation. That shell can outlive the
+study, so a loose pattern would report "study alive" forever and the watchdog
+would never restart anything. Measured:
+
+```
+'bin/heretic --model /models/DeepSeek-V4'                    -> 2377625 2377627   (bash + study)
+'^/opt/heretic-dgx/.venv/bin/python .venv/bin/heretic'       -> 2377627           (study only)
+```
+
+### The exact relaunch command
+
+Recovered verbatim from `/proc/<launcher>/cmdline`, because `ps` truncates it:
+
+```sh
+cd /opt/heretic-dgx && CUDA_VISIBLE_DEVICES= nohup .venv/bin/heretic \
+    --model /models/DeepSeek-V4.1-Flash --config ./config.dsv41.toml \
+    --seed 20250913 </dev/null >> prod-run1.log 2>&1 &
+```
+
+`CUDA_VISIBLE_DEVICES=` is empty on purpose: vLLM owns the GPUs, so the Heretic
+side is pinned to CPU.
+
+### Resuming works
+
+It has been exercised for real. A run that reached `Elapsed time: 9h 30m` was
+relaunched and picked up from the Optuna journal with trial numbering intact
+(trial 44 → 65) — `checkpoint_action = "continue"` plus the journal at
+`checkpoints/--models--DeepSeek-V4--1-Flash.jsonl`. Only the in-flight trial is
+lost, about 13 minutes.
+
+Note the off-by-one when reading that log: Optuna's `trial_id` is 0-based while
+the progress line is 1-based, so `Trial 43 failed` refers to displayed
+`trial 44`.
+
+### An obsolete unit was crash-looping on node 1
+
+`vllm-controller.service` (a *system* unit) was failing every 5 seconds with
+`status=203/EXEC`, because its `ExecStart=/home/hyudryu/VLLMController/run.sh`
+no longer exists — the project was renamed to SparkDeck. It had reached
+**NRestarts=50703** over roughly three days and was writing ~2,700 journal lines
+per hour.
+
+It served nothing: :7878 is actually handled by SparkDeck's own router
+(`SparkDeck/.venv/bin/python sparkdeck-router-surviving-group/server.py`) under
+`systemd --user`. Disabling the stale unit stopped the loop, and vacuuming the
+journal it had filled freed **3.4 GB** on a disk that was 99% full. Verified
+afterwards that `docker.service`, the running model container, :8014 and :7878
+were all unaffected, and that the study PID had not changed.
+
+### Retry width
+
+The engine restart that killed the earlier run surfaced as
+`ConnectionRefusedError` and `Remote end closed connection without response` in
+the shim — i.e. the engine was *down*, not hiccuping. Reloading this checkpoint
+takes minutes, so `HttpVllmTransport` retries transient statuses
+(`429/502/503/504`) and connection errors 8 times with exponential backoff capped
+at 30 s: a window of roughly 90 s, which rides out a short restart while staying
+well inside the backend's own `vllm_timeout_seconds` (600).
