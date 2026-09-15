@@ -75,6 +75,33 @@ The result is the **un-normalized** collapsed stream, which is what
 abliteration wants: the attention output is added to the residual, not to the
 normalized input.
 
+## The type contract holds
+
+`hc_collapse_triton` asserts three things, and a mismatch would take the engine
+down on the first request rather than degrade quietly — so the patch must
+satisfy all three:
+
+```python
+assert x.ndim == 3 and x.dtype == torch.bfloat16
+num_tokens, hc_mult, hidden_size = x.shape
+assert pre_mix.shape == (num_tokens, hc_mult)
+assert pre_mix.dtype == torch.float32
+```
+
+**`x` is `aux_recon`.** `mhc_post_tilelang` returns `torch.empty_like(residual)`,
+so it carries the residual's dtype and shape exactly. `residual` is documented as
+*"BF16 residual streams of shape (tokens, hc_mult, hidden_size)"* — so
+`aux_recon` is bf16, 3-dimensional, `(tokens, 4, 5120)`. ✓
+
+**`pre_mix` is the loop variable**, i.e. the layer's fourth return value
+(`ffn_pre` from `mhc_pre_delayed_tilelang`), documented as *"the next FP32
+pre-mix, with shapes … (tokens, hc_mult)"*. ✓
+
+`hc_mult` extracted from `x.shape[1]` is therefore the same `hc_mult` the mix's
+second dimension carries, so the shapes agree by construction rather than by
+coincidence. `pre_mix` is never `None` at the capture site: the layer computes
+`ffn_pre` on every path before returning it, including layer 0.
+
 ## Why it matters
 
 The learned mixes are far from uniform
