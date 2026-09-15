@@ -29,9 +29,17 @@
 # 10  restore supervision
 set -eu
 
-RECIPE=ff09e9a8
-OLD_DEPLOY=8fd087c422c5
-NEW_IMAGE=vllm-dsv41:pinned-ehs3-hccollapse
+# RECIPE selects the profile. The two differ ONLY in the engine image, which is
+# what makes this script also the rollback path:
+#
+#   ff09e9a8  vllm-dsv41:pinned-ehs3-hccollapse   patched (mix-weighted collapse)
+#   5ae70a64  vllm-dsv41:pinned-ehs2              rollback (pre-patch, validated)
+#
+# Roll back with:  RECIPE=5ae70a64 NEW_IMAGE=vllm-dsv41:pinned-ehs2 \
+#                      scripts/deploy_hc_collapse_patch.sh
+RECIPE=${RECIPE:-ff09e9a8}
+NEW_IMAGE=${NEW_IMAGE:-vllm-dsv41:pinned-ehs3-hccollapse}
+OLD_DEPLOY=${OLD_DEPLOY:-8fd087c422c5}
 RUN=/opt/heretic-dgx
 STAMP=$(date +%Y%m%d-%H%M%S)
 JOURNAL="$RUN/checkpoints/--models--DeepSeek-V4--1-Flash.jsonl"
@@ -39,6 +47,8 @@ JOURNAL="$RUN/checkpoints/--models--DeepSeek-V4--1-Flash.jsonl"
 say() { printf '\n=== %s ===\n' "$*"; }
 
 say "0. preconditions"
+echo "  recipe   : $RECIPE"
+echo "  image    : $NEW_IMAGE"
 docker image inspect "$NEW_IMAGE" >/dev/null 2>&1 || {
     echo "FATAL: $NEW_IMAGE is not present on this node"; exit 1; }
 docker run --rm --entrypoint grep -q 'hc_collapse_triton(aux_recon, pre_mix)' \

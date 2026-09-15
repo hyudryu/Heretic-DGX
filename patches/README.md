@@ -145,13 +145,34 @@ line present, the old assignment absent.
 whole transition; read it before running it, because it stops a run the user
 asked for.
 
-The deployment recipe already exists: **`ff09e9a8`** —
-*"Heretic abliteration - V4.1 TP4 (hc-collapse patch)"*. It was built by reading
-the **live** deployment's own configuration and changing exactly one field, so
-its 49 `extra_args` and 34 environment variables are the validated profile
-verbatim rather than a hand-transcription. `scripts/make_patched_recipe.py`
-regenerates it and refuses to build if the live profile is not using
-`extract_hidden_states`, or if `dspark` appears anywhere in its spec.
+Two profiles exist, differing **only** in the engine image — which is what makes
+the same script the rollback path:
+
+| recipe | image | role |
+|---|---|---|
+| `ff09e9a8` | `vllm-dsv41:pinned-ehs3-hccollapse` | patched (mix-weighted collapse) |
+| `5ae70a64` | `vllm-dsv41:pinned-ehs2` | rollback (pre-patch, validated) |
+
+Both carry the identical 49 `extra_args` and 34 environment variables, read from
+the **live** deployment's own configuration rather than hand-transcribed — the
+live profile gained its LoRA flags and `VLLM_ALLOW_RUNTIME_LORA_UPDATING`
+through deploy-time overrides, which a hand-written recipe would have missed.
+`scripts/make_patched_recipe.py` regenerates either one and refuses to build if
+the live profile is not on `extract_hidden_states`, or if `dspark` appears in
+its spec — a guard against reusing this image where the mean-collapse is
+required.
+
+Deploy the patch:
+
+```sh
+scripts/deploy_hc_collapse_patch.sh
+```
+
+Roll back:
+
+```sh
+RECIPE=5ae70a64 NEW_IMAGE=vllm-dsv41:pinned-ehs2 scripts/deploy_hc_collapse_patch.sh
+```
 
 The script's ordering, and why:
 

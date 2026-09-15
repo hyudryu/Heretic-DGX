@@ -17,14 +17,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sparkdeck  # noqa: E402
 
 LIVE = "8fd087c422c5"
-NEW_IMAGE = "vllm-dsv41:pinned-ehs3-hccollapse"
-NAME = "Heretic abliteration - V4.1 TP4 (hc-collapse patch)"
+NEW_IMAGE = sys.argv[1] if len(sys.argv) > 1 else "vllm-dsv41:pinned-ehs3-hccollapse"
+NAME = (
+    sys.argv[2]
+    if len(sys.argv) > 2
+    else "Heretic abliteration - V4.1 TP4 (hc-collapse patch)"
+)
 
 # Heretic-only. The patched collapse is wrong for the production DSpark drafter.
 NOTE = (
     "[HERETIC ONLY] aux hidden state collapsed with the carried pre-mix instead "
     "of a plain mean. Do not use with --speculative-config dspark: the draft "
     "model was trained against mean-collapsed states. See patches/README.md."
+)
+ROLLBACK_NOTE = (
+    "[HERETIC, ROLLBACK TARGET] the validated pre-patch profile. Deploy this to "
+    "return to the configuration that ran before the hc-collapse patch."
 )
 
 
