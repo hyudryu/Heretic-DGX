@@ -76,13 +76,13 @@ Reproduce with `scripts/measure_refusal_rate.py`.
 This agrees with Heretic's baseline of 98/100 (i.e. ~90–98% refusal) and with
 the trials landing within a few points of it.
 
-## The most likely cause: most layers are never ablated
+## Layer coverage: checked, and it is NOT the explanation
 
-The exported adapter for a trial contains **26 tensors = 13 layers**, not 40.
-Two independent facts explain it.
+The exported adapter for trial 67 contains **26 tensors = 13 layers**, not 40,
+which looked like the cause. It is not.
 
-The trial parameters bound the ablation to a band of layers
-(`src/heretic/abliteration_math.py`):
+`layer_ablation_weight` does bound the ablation to a band around
+`max_weight_position` (`src/heretic/abliteration_math.py`):
 
 ```python
 def layer_ablation_weight(...):
@@ -95,13 +95,22 @@ def layer_ablation_weight(...):
         return None            # <-- no ablation for these layers at all
 ```
 
-For trial 67 (`max_weight_position = 26.27`, `min_weight_distance = 7.51`) the
-covered band is layers **≈18.8 – 33.8** — about 15 layers, and the adapter holds
-13. Across the trials logged so far, `min_weight_distance` ranged from **2.55 to
-17.59**, so at the low end fewer than six layers receive any ablation.
+But measuring the actual parameters across all 67 trials shows trial 67 sat at
+the narrow end of the distribution, not the middle:
 
-This is Heretic's own schedule rather than a porting bug, and it is why the
-observable effect is so small. It is the first thing to check, not the last.
+| parameter | min | median | max |
+|---|---|---|---|
+| `min_weight_distance` | 1.70 | **12.86** | 23.34 |
+| `max_weight_position` | 23.50 | 31.08 | 38.67 |
+
+A median distance of 12.86 covers roughly **26 layers**; a distance of 23.34
+covers essentially all 40. So most trials ablate a substantial span, and layer
+coverage is not what is suppressing the effect. The band is also always centred
+in the second half of the network (`max_weight_position` is searched over
+23.4–39.0), so early layers never receive the peak weight — worth noting, but
+not a sufficient explanation either.
+
+**The cause is therefore not yet identified.** See "Next experiment" below.
 
 ### What is *not* the explanation
 
@@ -115,8 +124,26 @@ observable effect is so small. It is the first thing to check, not the last.
   layer `L` — see `HIDDEN_STATE_CAPTURE.md`.
 - **Scoring is on the chat path**, the same path a user hits
   (`deepseek_v41_runtime.py` generation goes to `/v1/chat/completions`).
+- **Layer coverage**, as shown above.
 
-So the plumbing works end to end. What is missing is *effect*.
+So the plumbing works end to end and the search does cover the network. What is
+missing is *effect*.
+
+## Next experiment (needs the study paused)
+
+The decisive test is to distinguish "the ablation is too weak" from "the
+ablation is misdirected". Load a deliberately extreme adapter — `max_weight` at
+the top of its range, `min_weight_distance` at 23.34 so every layer is covered —
+and measure refusals with `scripts/measure_refusal_rate.py`:
+
+- If refusals collapse toward zero, the direction and plumbing are correct and
+  the problem is the objective's dynamic range, not the mechanism.
+- If refusals barely move even at maximum strength, the direction or the layer
+  mapping is wrong, and no amount of searching will help.
+
+This cannot be run alongside the study: the engine is configured with
+`--max-loras 1`, so loading a probe adapter would displace `heretic-trial` and
+destroy the in-flight trial.
 
 ## Consequences for the running study
 
