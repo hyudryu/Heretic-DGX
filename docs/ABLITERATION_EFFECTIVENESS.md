@@ -114,32 +114,91 @@ not a sufficient explanation either.
 
 ### What is *not* the explanation
 
+Each of these was checked directly rather than reasoned about. Together they
+eliminate the whole plumbing hypothesis, which is why the remaining candidates
+are architectural.
+
+- **The captured residual stream is faithful.** A residual stream changes slowly
+  with depth, so adjacent captured layers must be similar. Measured over 8
+  harmful + 8 harmless prompts: **mean adjacent-layer cosine 0.919** (individual
+  pairs 0.76–0.97). A corrupted capture — wrong layer mapping, a bad
+  hyper-connection collapse, an off-by-one — would be near-orthogonal.
+  Reproduce with `scripts/diag_direction.py`.
+- **The refusal directions are real.** Leave-one-out accuracy along
+  `normalize(bad_mean - good_mean)` is **1.00 for every layer from 2 to 39**,
+  with a best-case margin of **8.97** at layer 26. These are not noise vectors.
+- **The LoRA construction is correct.** `compute_directional_lora` builds
+  `a = dᵀW` (shape `[1, 8192]`) and `b = -strength·d` (shape `[5120, 1]`), so
+  `b @ a = -s·outer(d, Wᵀd)`, which is exactly `(I - s·d dᵀ)W - W`. It also
+  validates `direction.shape[0] == weight.shape[0]`, i.e. it correctly treats
+  `d` as living in the **output** space — which matters because `wo_b` is
+  **8192 → 5120 and not square**, unlike the `o_proj` Heretic was written
+  against.
 - **The adapter is real and non-zero.** Rank 3, `lora_alpha = 3`,
-  `target_modules = ["wo_b"]`, 519,168 parameters, mean |w| = 4.4e-3,
-  max |w| = 9.95e-2. It is not an empty file.
-- **It loads cleanly.** `/v1/load_lora_adapter` returns 200 and the adapter
-  appears in `/v1/models` as `heretic-trial`.
-- **The layer mapping matches the documented convention.** The shim resolves
-  Heretic layer `L` to capture row `max(L-1, 0)`, which is the stream entering
-  layer `L` — see `HIDDEN_STATE_CAPTURE.md`.
+  `target_modules = ["wo_b"]`, 519,168 float32 parameters, mean |w| = 4.4e-3,
+  max |w| = 9.95e-2.
+- **Its magnitudes follow the search's schedule.** `‖ΔW‖_F` peaks at layer 26,
+  and trial 67's `max_weight_position` is 26.27, with layers 21–33 present —
+  exactly the band the weight schedule predicts.
+- **The engine really applies it.** vLLM's own LoRA kernels compile and run on
+  the worker:
+
+  ```
+  Worker_TP0 WARNING [jit_monitor.py:141] Triton kernel JIT compilation during
+    inference: _lora_shrink_kernel
+  Worker_TP0 WARNING [jit_monitor.py:141] Triton kernel JIT compilation during
+    inference: _lora_expand_kernel
+  ```
+
+  and the load/unload cycle repeats every trial with HTTP 200
+  (`lora_target_modules: ['wo_b']`, `enable_lora: True`).
 - **Scoring is on the chat path**, the same path a user hits
   (`deepseek_v41_runtime.py` generation goes to `/v1/chat/completions`).
-- **Layer coverage**, as shown above.
+- **Layer coverage** — see above.
 
-So the plumbing works end to end and the search does cover the network. What is
-missing is *effect*.
+One measurement is consistent but not conclusive: comparing the adapter's
+dominant **left** singular vector against an independently measured direction
+gives cos 0.44–0.86 (mean 0.62). That is what one expects from a direction
+estimated on only 8 prompts against one estimated on 400, but it is too weak to
+confirm or refute anything.
 
-## Next experiment (needs the study paused)
+So the plumbing is sound, the geometry is sound, and the search does cover the
+network. **What is missing is effect.**
 
-The decisive test is to distinguish "the ablation is too weak" from "the
-ablation is misdirected". Load a deliberately extreme adapter — `max_weight` at
-the top of its range, `min_weight_distance` at 23.34 so every layer is covered —
-and measure refusals with `scripts/measure_refusal_rate.py`:
+## Remaining hypotheses
 
-- If refusals collapse toward zero, the direction and plumbing are correct and
-  the problem is the objective's dynamic range, not the mechanism.
-- If refusals barely move even at maximum strength, the direction or the layer
-  mapping is wrong, and no amount of searching will help.
+With the plumbing eliminated, two architectural explanations remain. Both are
+specific to V4.1 rather than to Heretic.
+
+1. **`wo_b` alone may not be where refusal is written.** V1 ablates only the 40
+   attention output projections. In a 552B MoE model the residual stream is also
+   written by the expert/MLP path, and by Engram. Heretic supports widening this
+   — `abliteration_components` — and V1 deliberately restricted it. Widening it
+   is a cheap, high-value experiment.
+2. **The ablation and the measurement may live in different spaces.** The
+   refusal direction is measured on the **collapsed** residual stream (width
+   5120, after the `hc_mult = 4` hyper-connection collapse via `.mean(dim=1)`),
+   but `wo_b` writes into the **pre-collapse** hyper-connection representation.
+   Projecting `d` out of `wo_b`'s output therefore does not necessarily remove
+   `d` from the collapsed stream that the direction was measured on. Nothing in
+   the current pipeline checks for this mismatch.
+
+Hypothesis 2 is the more specific and the more likely to be decisive, because it
+is a property of this architecture that Heretic has never been run against.
+
+## The decisive experiment (needs the study paused)
+
+Load a deliberately extreme adapter — `max_weight` at the top of its range and
+`min_weight_distance` at 23.34 so every layer is covered — then re-measure with
+`scripts/measure_refusal_rate.py`:
+
+- **Refusals collapse toward zero** → the mechanism works and full strength was
+  simply never explored; the problem is the objective's dynamic range.
+- **Refusals barely move at maximum strength** → strength is not the variable,
+  and hypothesis 1 or 2 is correct.
+
+Either outcome is decisive, and it takes minutes rather than the 28 hours the
+current search has left.
 
 This cannot be run alongside the study: the engine is configured with
 `--max-loras 1`, so loading a probe adapter would displace `heretic-trial` and
