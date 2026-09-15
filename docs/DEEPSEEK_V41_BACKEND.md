@@ -145,23 +145,57 @@ Verified against the real checkpoint (node `gx10-node-1`, 2026-09-13):
 | 1. Read config, select backend, no weight load | **PASS** -- `vllm_deepseek_v41`, 0 Transformers calls |
 | 2. Discover exactly 40 `wo_b` targets | **PASS** -- 40 found in 0.12 s, metadata only |
 | 3. Cache and dequantize targets, verify dimensions | **PASS** -- `(5120, 8192)` fp32, finite, no zero rows, 3.7 s for all 40, 1.47 GiB peak RSS |
-| 4-11 (generate, logits, residuals, LoRA apply/reset, one real trial) | **NOT RUN** |
+| 4-11 (generate, logits, residuals, LoRA apply/reset, one real trial) | **PASS** -- see 2026-09-14 update below |
 
-Gates 4-11 require a **running vLLM deployment** and were not executed: no vLLM
-server was listening, and no vLLM was installed in a usable Python environment at
-the time. The HTTP transport, the hidden-state endpoint contract and the raw-logit
-response shape are therefore **written but unvalidated against a live server**.
+Update 2026-09-14 (evening): the full loop has run end to end through
+Heretic's own runtime. Deployment `1fddccd26a01` (image
+`vllm-dsv41:pinned-ehs2`, api port 8014 on gx10-node-1) plus the HTTP shim
+(`_tools/heretic_shim.py` in the Spark Management workspace, running on
+gx10-node-1) completed real Optuna trials: per-trial adapter build, 4-node
+adapter sync, `/v1/load_lora_adapter`, scorer generation and KLD with the
+adapter active, then unload/reset. Early smoke trials (reduced prompt counts:
+25/25 residual, 5/5 scorer) showed finite, small KL divergences
+(0.038 -> 0.007 over the first completed trials) and ~45-60 s per trial.
+
+Three integration fixes were required, all verified:
+
+1. **Image `pinned-ehs2`**: `DeepseekV41ForCausalLM` (the multimodal wrapper in
+   `vl_model.py`) now inherits `SupportsLoRA`. The inner LLM class had it; the
+   wrapper the server instantiates did not, and `--enable-lora` died at worker
+   startup. The wrapper's existing `hf_to_vllm_mapper` resolves adapter names
+   (`base_model.model.layers.N...` -> `language_model.model.layers.N...`).
+2. **Recipe**: `--enable-lora --max-loras 1 --max-lora-rank 8
+   --lora-target-modules wo_b`, plus env `VLLM_ALLOW_RUNTIME_LORA_UPDATING=1`
+   (without it the router is never attached and the endpoints 404), and
+   `gpu_memory_utilization` 0.83 (startup free-memory check is tight).
+   `--lora-target-modules` takes a plain value, not JSON.
+3. **Heretic fixes** (this repo): `main.py` `run()` defaulted
+   `runtime_factory=LocalModelRuntime`, which `create_runtime` rejects for this
+   backend -- the CLI could never reach it (default is now `None`);
+   `deepseek_v41_runtime.py` `_post` now tolerates the empty/plain-text 200
+   bodies of the LoRA action endpoints and retries transient connection drops.
+
+The shim's role: serves `POST /heretic/hidden_states` by driving a 1-token
+chat completion, reading the connector's safetensors spool (as root; the
+spool files are root-owned 0600), and deleting files after reading. It also
+rewrites `lora_name` request keys to vLLM's `model`-field convention, unloads
+a stale same-name adapter before each load, rsyncs adapters to the other
+three nodes (no shared FS), and sweeps orphaned spool files (every request
+produces one; only capture calls consume them).
+
 `save_merged` refuses outright rather than emitting an unvalidated checkpoint.
 
 ### Why this matters for the report
 
-Nothing here should be read as "V4.1 works". What is established is that Heretic
-can now *reach* a V4.1 model without `transformers`, that the 40 physical targets
-are found and readable, and that the abliteration math is backend-independent and
-proven identical to the pre-refactor implementation. Whether vLLM serves dense
-raw logits, whether the hidden-state capture point can be requested, and whether
-LoRA applies to this multimodal checkpoint are all **open** and need the
-deployment up.
+What is established: Heretic can *reach* a V4.1 model without `transformers`,
+the 40 physical targets are found and readable, the abliteration math is
+backend-independent and proven identical to the pre-refactor implementation,
+and (since 2026-09-14) the full loop runs against the live deployment --
+dense raw logits serve, the hidden-state capture point answers through the
+shim, and LoRA applies to and detaches from this multimodal checkpoint across
+all four TP4 ranks. What remains open is *search quality*: whether the
+captured residuals (with the documented layer-0 proxy and mean-collapse
+approximations) yield good abliterations, which only the staged run answers.
 
 ## Configuration
 

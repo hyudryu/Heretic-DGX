@@ -100,7 +100,7 @@ from .reproduce import (
     collect_reproducibles,
     load_reproduction_information,
 )
-from .runtime import LocalModelRuntime, ModelRuntime
+from .runtime import ModelRuntime
 from .standalone_export import (
     LAGUNA_S_2_1_FP8_IDENTITY,
     save_runtime_as_standalone,
@@ -287,7 +287,7 @@ def _synchronize_model_settings(
 
 def run(
     *,
-    runtime_factory: Callable[[Model], ModelRuntime] = LocalModelRuntime,
+    runtime_factory: Callable[[Model], ModelRuntime] | None = None,
     worker_runner: Callable[[Model], None] | None = None,
     settings_synchronizer: Callable[[Settings | None], Settings | None] | None = None,
 ):

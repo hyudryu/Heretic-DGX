@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -223,21 +224,47 @@ class HttpVllmTransport:
         )
         if self.api_key:
             request.add_header("Authorization", f"Bearer {self.api_key}")
+        raw = self._send(request, path)
+        if not raw.strip():
+            # Action endpoints (load/unload LoRA) answer 200 with an empty or
+            # plain-text body on success. Only data endpoints need JSON.
+            return {}
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310
-                decoded = json.loads(response.read())
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", "replace")[:500]
-            raise BackendUnavailable(
-                f"vLLM request to {path} failed with HTTP {error.code}: {detail}"
-            ) from error
-        except urllib.error.URLError as error:
-            raise BackendUnavailable(
-                f"vLLM at {self.base_url} is unreachable: {error.reason}"
-            ) from error
+            decoded = json.loads(raw)
+        except json.JSONDecodeError:
+            # Tolerate plain-text success bodies ("Success: ...") on 2xx.
+            return {"text": raw.decode("utf-8", "replace")}
         if not isinstance(decoded, dict):
             raise BackendUnavailable(f"vLLM returned a non-object body from {path}")
         return decoded
+
+    def _send(self, request: urllib.request.Request, path: str) -> bytes:
+        """POST with retries on transient connection failures.
+
+        A multi-hour optimization run will eventually hit a dropped connection
+        (proxy restart, engine hiccup). All endpoints used here are safe to
+        retry: reads are idempotent, and load_lora replaces rather than
+        accumulates. HTTP errors (4xx/5xx) are not retried -- they are
+        deterministic answers, not transients.
+        """
+
+        last_error: Exception | None = None
+        for attempt in range(4):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:  # noqa: S310
+                    return response.read()
+            except urllib.error.HTTPError as error:
+                detail = error.read().decode("utf-8", "replace")[:500]
+                raise BackendUnavailable(
+                    f"vLLM request to {path} failed with HTTP {error.code}: {detail}"
+                ) from error
+            except (urllib.error.URLError, ConnectionError, TimeoutError) as error:
+                last_error = error
+                if attempt < 3:
+                    time.sleep(1.0 * (attempt + 1))
+        raise BackendUnavailable(
+            f"vLLM at {self.base_url} is unreachable after retries: {last_error}"
+        ) from last_error
 
     @staticmethod
     def _extra_body(lora_name: str | None) -> dict[str, Any]:
