@@ -202,8 +202,32 @@ specific to V4.1 rather than to Heretic.
 
    Nothing in the pipeline checks this, and it is a property of this
    architecture that Heretic has never been run against. It is now the leading
-   hypothesis, and it is testable: compare `d` against
-   `collapse(mhc_post(d))` using the layer's own mix weights.
+   hypothesis — **and the layer parameters support it quantitatively.**
+
+   The mix coefficients are learned and far from uniform
+   (`scripts/check_hc_mixes.py`, read straight from the checkpoint):
+
+   | tensor | shape | mean | std | min | max |
+   |---|---|---|---|---|---|
+   | `hc_attn_base` | (24,) | −8.74 | 11.55 | **−25.49** | **+13.44** |
+   | `hc_attn_scale` | (3,) | 0.0455 | 0.0291 | 0.0120 | 0.0630 |
+   | `hc_attn_fn` | (24, 20480) | −0.0001 | 0.0225 | −1.108 | 1.543 |
+
+   Across all 40 layers, `std/|mean|` is **1.93** for `hc_attn_base` and **0.67**
+   for `hc_attn_scale`. At layer 0 the per-copy biases alone span **39 logit
+   units** (−25.5 … +13.4). Passed through a softmax, a spread that wide makes
+   the real collapse behave closer to *selecting one hyper-connection copy* than
+   to averaging four.
+
+   So `.mean(dim=1)` is not a mild approximation of the true collapse — it can
+   be close to orthogonal to it. That is exactly the failure mode that would
+   leave the directions excellent at separating harmful from harmless prompts
+   while the ablation fails to change behaviour: the separation survives
+   averaging, but the direction being subtracted is not the direction the model
+   actually reads.
+
+   This is consistent with every other measurement and requires no new
+   hypothesis to explain the ~4% ceiling.
 
 ## The search space is fully explored, and strength does nothing
 
